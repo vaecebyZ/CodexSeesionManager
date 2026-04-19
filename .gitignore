@@ -1,0 +1,11 @@
+/.mitmproxy
+/__pycache__
+/logs
+/config.json
+/codex_session.egg-info
+/build
+/auth
+/.idea
+
+*.log
+*.pyc
