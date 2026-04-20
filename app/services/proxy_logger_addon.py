@@ -1,11 +1,31 @@
 from __future__ import annotations
 
+import logging
 import os
 import socket
 import time
 from threading import Event, Lock, Thread
 
 from mitmproxy import http
+
+
+_RESELECT_EVENT = "RESELECT"
+_IDLE_TIMEOUT_EVENT = "IDLE_TIMEOUT"
+
+
+class _PingPongLogHandler(logging.Handler):
+    def __init__(self, addon: "ProxyLoggerAddon") -> None:
+        super().__init__(level=logging.INFO)
+        self._addon = addon
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return
+        if "Received WebSocket ping from" not in message and "Received WebSocket pong from" not in message:
+            return
+        self._addon.handle_ping_pong_log()
 
 
 def _log(message: str) -> None:
@@ -17,16 +37,29 @@ class ProxyLoggerAddon:
         self._idle_lock = Lock()
         self._flow_lock = Lock()
         self._last_activity = time.monotonic()
-        self._last_idle_report = 0.0
+        self._reselect_sent = False
         self._idle_kill_sent = False
         self._stop_event = Event()
         self._watcher: Thread | None = None
+        self._idle_watcher: Thread | None = None
+        self._log_handler: _PingPongLogHandler | None = None
+        self._websocket_logger: logging.Logger | None = None
+        self._websocket_logger_level: int | None = None
         self._upload_bytes = 0
         self._download_bytes = 0
         self._live_flows: dict[str, object] = {}
 
     def load(self, loader) -> None:
         _log("日志插件已加载")
+        self._log_handler = _PingPongLogHandler(self)
+        # WebSocket ping/pong 的实际日志由 proxy.server 输出。
+        self._websocket_logger = logging.getLogger("mitmproxy.proxy.server")
+        self._websocket_logger_level = self._websocket_logger.level
+        if self._websocket_logger.getEffectiveLevel() > logging.INFO:
+            self._websocket_logger.setLevel(logging.INFO)
+        self._websocket_logger.addHandler(self._log_handler)
+        self._idle_watcher = Thread(target=self._watch_idle_reselect, daemon=True)
+        self._idle_watcher.start()
         self._watcher = Thread(target=self._watch_idle_timeout, daemon=True)
         self._watcher.start()
 
@@ -36,7 +69,7 @@ class ProxyLoggerAddon:
     def _mark_activity(self) -> None:
         with self._idle_lock:
             self._last_activity = time.monotonic()
-            self._last_idle_report = 0.0
+            self._reselect_sent = False
             self._idle_kill_sent = False
 
     def _track_flow(self, flow) -> None:
@@ -54,7 +87,7 @@ class ProxyLoggerAddon:
                 if getattr(flow, "live", False)
             }
 
-    def _kill_active_flows(self) -> None:
+    def _kill_active_flows(self) -> int:
         with self._flow_lock:
             flows = list(self._live_flows.values())
         killed = 0
@@ -67,23 +100,34 @@ class ProxyLoggerAddon:
             except Exception:
                 continue
         self._cleanup_flows()
-        _log(f"kill active flows: {killed}")
+        return killed
 
-    def _watch_idle_timeout(self) -> None:
+    def _watch_idle_reselect(self) -> None:
         while not self._stop_event.wait(0.5):
             with self._idle_lock:
                 now = time.monotonic()
                 if now - self._last_activity < 5.0:
                     continue
+                if self._reselect_sent:
+                    continue
+                self._reselect_sent = True
+            self._report_control_event(_RESELECT_EVENT)
+            _log("超过 5 秒没有数据输出，重新选举负载")
+
+    def _watch_idle_timeout(self) -> None:
+        while not self._stop_event.wait(0.5):
+            with self._idle_lock:
+                now = time.monotonic()
+                if now - self._last_activity < 60.0:
+                    continue
                 if self._idle_kill_sent:
                     continue
-                if now - self._last_idle_report < 180.0:
-                    continue
-                self._last_idle_report = now
                 self._idle_kill_sent = True
-            self._kill_active_flows()
-            self._report_control_event("IDLE")
-            _log("超过 180 秒没有数据流出")
+            killed = self._kill_active_flows()
+            self._report_control_event(_IDLE_TIMEOUT_EVENT)
+            if killed > 0:
+                _log(f"kill active flows: {killed}")
+            _log("超过 60 秒没有数据流出")
 
     def _get_selected_access_token(self) -> str:
         port_text = os.environ.get("AUTOLOAD_CONTROL_PORT", "").strip()
@@ -145,18 +189,40 @@ class ProxyLoggerAddon:
             return
 
     def _report_control_event(self, event_name: str) -> None:
+        self._send_control_message(event_name)
+
+    def _send_control_message(self, message: str, read_response: bool = False) -> str:
         port_text = os.environ.get("AUTOLOAD_CONTROL_PORT", "").strip()
         if not port_text:
-            return
+            return ""
         try:
             port = int(port_text)
         except ValueError:
-            return
+            return ""
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2) as conn:
-                conn.sendall(f"{event_name}\n".encode("utf-8"))
+                conn.settimeout(0.2)
+                conn.sendall(f"{message}\n".encode("utf-8"))
+                if not read_response:
+                    return ""
+                try:
+                    data = conn.recv(256)
+                except OSError:
+                    return ""
         except OSError:
-            return
+            return ""
+        return data.decode("utf-8", errors="ignore").strip()
+
+    def handle_ping_pong_log(self) -> None:
+        if self._consume_pending_kill_flag():
+            killed = self._kill_active_flows()
+            if killed > 0:
+                _log(f"ping/pong 命中，已断开 {killed} 个代理连接")
+            else:
+                _log("ping/pong 命中，但未找到可断开的代理连接")
+
+    def _consume_pending_kill_flag(self) -> bool:
+        return self._send_control_message("PINGPONG", read_response=True) == "1"
 
     def client_connected(self, *args, **kwargs) -> None:
         self._mark_activity()
@@ -215,6 +281,11 @@ class ProxyLoggerAddon:
         self._download_bytes += self._estimate_http_bytes(resp.headers, resp.raw_content)
         self._report_traffic()
 
+    def websocket_message(self, flow: http.HTTPFlow) -> None:
+        self._mark_activity()
+        self._track_flow(flow)
+        return None
+
     def error(self, flow: http.HTTPFlow) -> None:
         self._track_flow(flow)
         self._cleanup_flows()
@@ -225,6 +296,17 @@ class ProxyLoggerAddon:
 
     def done(self) -> None:
         self._stop_event.set()
+        if self._websocket_logger is not None and self._log_handler is not None:
+            try:
+                self._websocket_logger.removeHandler(self._log_handler)
+            except Exception:
+                pass
+            if self._websocket_logger_level is not None:
+                self._websocket_logger.setLevel(self._websocket_logger_level)
+            self._websocket_logger = None
+            self._websocket_logger_level = None
+        if self._log_handler is not None:
+            self._log_handler = None
         _log("代理插件退出")
 
 addons = [ProxyLoggerAddon()]

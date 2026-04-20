@@ -65,6 +65,7 @@ class ProxyWindow:
         self._upstream_proxy = self.service.config.upstream_proxy
         self._auto_load_target_refresh_token = ""
         self._auto_load_target_access_token = ""
+        self._proxy_kill_pending = False
         self._auto_load_control_stop = Event()
         self._auto_load_control_socket: socket.socket | None = None
         self._auto_load_control_port = self._start_auto_load_control_server()
@@ -76,6 +77,8 @@ class ProxyWindow:
         self._traffic_refresh_pending = False
         self._quota_refresh_pending = False
         self._ui_queue: Queue[Callable[[], None]] = Queue()
+        self._last_install_rows_signature: tuple[tuple[str, str, str, str], ...] | None = None
+        self._last_auth_rows_signature: tuple[tuple[bool, bool, str, str, str, str, str, int], ...] | None = None
 
         self._build_ui()
         self.root.after(50, self._drain_ui_queue)
@@ -395,6 +398,7 @@ class ProxyWindow:
             self._recompute_auto_load_target()
             return
         self._set_auto_load_target("", "")
+        self._clear_proxy_kill_pending()
         self.refresh_auth_files(update_status=False)
 
     def _recompute_auto_load_target(self) -> None:
@@ -402,9 +406,11 @@ class ProxyWindow:
             if not self._auto_load_enabled:
                 return
             current_refresh_token = self._auto_load_target_refresh_token
+            current_access_token = self._auto_load_target_access_token
         rows = self.auth_sync_service.list_auth_rows()
         if not rows:
             self._set_auto_load_target("", "")
+            self._clear_proxy_kill_pending()
             print("[AutoLoad] 当前没有可选授权文件", flush=True)
             return
         row = max(rows, key=lambda item: (self._quota_priority(item.quota), item.refresh_token))
@@ -414,6 +420,11 @@ class ProxyWindow:
                 f"[AutoLoad] 负载目标: account_id={row.account_id} refresh_token={row.refresh_token} quota={row.quota}",
                 flush=True,
             )
+        if current_access_token and row.access_token and row.access_token != current_access_token:
+            self._mark_proxy_kill_pending()
+            print("[AutoLoad] 负载对象已切换，等待 WebSocket ping/pong 后断开旧连接", flush=True)
+        else:
+            self._clear_proxy_kill_pending()
         self.refresh_auth_files(update_status=False)
 
     def _restart_proxy_server_async(self) -> None:
@@ -446,6 +457,21 @@ class ProxyWindow:
         with self._auto_load_lock:
             self._auto_load_target_refresh_token = refresh_token
             self._auto_load_target_access_token = access_token
+
+    def _mark_proxy_kill_pending(self) -> None:
+        with self._auto_load_lock:
+            self._proxy_kill_pending = True
+
+    def _clear_proxy_kill_pending(self) -> None:
+        with self._auto_load_lock:
+            self._proxy_kill_pending = False
+
+    def _consume_proxy_kill_pending(self) -> bool:
+        with self._auto_load_lock:
+            if not self._proxy_kill_pending:
+                return False
+            self._proxy_kill_pending = False
+            return True
 
     def _persist_config(self) -> None:
         try:
@@ -528,8 +554,13 @@ class ProxyWindow:
                                 continue
                             self._post_ui(lambda up=up_bytes, down=down_bytes: self._on_proxy_traffic_update(up, down))
                         continue
-                    if payload == "IDLE":
+                    if payload in {"IDLE", "RESELECT"}:
                         self._post_ui(self._recompute_auto_load_target)
+                        continue
+                    if payload == "PINGPONG":
+                        conn.sendall(("1\n" if self._consume_proxy_kill_pending() else "0\n").encode("utf-8"))
+                        continue
+                    if payload == "IDLE_TIMEOUT":
                         continue
                     token = self._get_auto_load_target_access_token()
                     conn.sendall((token + "\n").encode("utf-8"))
@@ -644,8 +675,10 @@ class ProxyWindow:
         for row in rows:
             item = self.tree.insert("", "end", values=(row.name, row.display_path, row.size, row.version, "启动"))
             self._rows_by_item[item] = row
-        if update_status:
+        signature = tuple((row.name, row.display_path, row.size, row.version) for row in rows)
+        if update_status and signature != self._last_install_rows_signature:
             print(f"已刷新 {len(rows)} 项")
+        self._last_install_rows_signature = signature
         return len(rows)
 
     def refresh_auth_files(self, update_status: bool = True) -> int:
@@ -670,8 +703,22 @@ class ProxyWindow:
                 ),
             )
             self._auth_rows_by_item[item] = row
-        if update_status:
+        signature = tuple(
+            (
+                row.current,
+                row.refresh_token == load_refresh_token,
+                row.account_id,
+                row.last_refresh,
+                row.quota_refresh_time_5h,
+                row.quota,
+                row.plan_type or "",
+                row.traffic,
+            )
+            for row in rows
+        )
+        if update_status and signature != self._last_auth_rows_signature:
             print(f"已刷新 {len(rows)} 个文件")
+        self._last_auth_rows_signature = signature
         return len(rows)
 
     def _scan_codex_installs(self) -> list[CodexInstallRow]:
