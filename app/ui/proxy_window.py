@@ -66,6 +66,7 @@ class ProxyWindow:
         self._auto_load_target_refresh_token = ""
         self._auto_load_target_access_token = ""
         self._proxy_kill_pending = False
+        self._proxy_kill_pending_access_token = ""
         self._auto_load_control_stop = Event()
         self._auto_load_control_socket: socket.socket | None = None
         self._auto_load_control_port = self._start_auto_load_control_server()
@@ -407,6 +408,7 @@ class ProxyWindow:
                 return
             current_refresh_token = self._auto_load_target_refresh_token
             current_access_token = self._auto_load_target_access_token
+            pending_access_token = self._proxy_kill_pending_access_token
         rows = self.auth_sync_service.list_auth_rows()
         if not rows:
             self._set_auto_load_target("", "")
@@ -420,8 +422,10 @@ class ProxyWindow:
                 f"[AutoLoad] 负载目标: account_id={row.account_id} refresh_token={row.refresh_token} quota={row.quota}",
                 flush=True,
             )
-        if current_access_token and row.access_token and row.access_token != current_access_token:
-            self._mark_proxy_kill_pending()
+        if row.access_token and row.access_token == pending_access_token:
+            self._clear_proxy_kill_pending()
+        elif current_access_token and row.access_token and row.access_token != current_access_token:
+            self._mark_proxy_kill_pending(row.access_token)
             print("[AutoLoad] 负载对象已切换，等待 WebSocket ping/pong 后断开旧连接", flush=True)
         else:
             self._clear_proxy_kill_pending()
@@ -458,19 +462,22 @@ class ProxyWindow:
             self._auto_load_target_refresh_token = refresh_token
             self._auto_load_target_access_token = access_token
 
-    def _mark_proxy_kill_pending(self) -> None:
+    def _mark_proxy_kill_pending(self, access_token: str) -> None:
         with self._auto_load_lock:
             self._proxy_kill_pending = True
+            self._proxy_kill_pending_access_token = access_token
 
     def _clear_proxy_kill_pending(self) -> None:
         with self._auto_load_lock:
             self._proxy_kill_pending = False
+            self._proxy_kill_pending_access_token = ""
 
     def _consume_proxy_kill_pending(self) -> bool:
         with self._auto_load_lock:
             if not self._proxy_kill_pending:
                 return False
             self._proxy_kill_pending = False
+            self._proxy_kill_pending_access_token = ""
             return True
 
     def _persist_config(self) -> None:
