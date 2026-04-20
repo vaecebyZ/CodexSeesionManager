@@ -7,6 +7,7 @@ import socket
 import subprocess
 import shutil
 import tempfile
+import time
 import tkinter as tk
 from dataclasses import dataclass
 from queue import Empty, Queue
@@ -67,6 +68,8 @@ class ProxyWindow:
         self._auto_load_control_stop = Event()
         self._auto_load_control_socket: socket.socket | None = None
         self._auto_load_control_port = self._start_auto_load_control_server()
+        self._proxy_restart_lock = Lock()
+        self._proxy_restart_pending = False
         self._port_entry: ttk.Entry | None = None
         self._upstream_entry: ttk.Entry | None = None
         self._traffic_status_var = tk.StringVar(value="上行: 0  下行: 0")
@@ -410,6 +413,32 @@ class ProxyWindow:
             flush=True,
         )
         self.refresh_auth_files(update_status=False)
+
+    def _restart_proxy_server_async(self) -> None:
+        with self._proxy_restart_lock:
+            if self._proxy_restart_pending:
+                return
+            if not (self.service.process and self.service.process.poll() is None):
+                return
+            self._proxy_restart_pending = True
+        Thread(target=self._restart_proxy_server_worker, daemon=True).start()
+
+    def _restart_proxy_server_worker(self) -> None:
+        try:
+            self.service.stop()
+            time.sleep(0.3)
+            ok, message = self.service.run()
+            if not ok:
+                print(f"[ProxyWindow] 代理重启失败: {message}", flush=True)
+        except Exception as exc:
+            print(f"[ProxyWindow] 代理重启异常: {exc}", flush=True)
+        finally:
+            with self._proxy_restart_lock:
+                self._proxy_restart_pending = False
+            try:
+                self._post_ui(self._update_toggle_button)
+            except tk.TclError:
+                pass
 
     def _set_auto_load_target(self, refresh_token: str, access_token: str) -> None:
         with self._auto_load_lock:

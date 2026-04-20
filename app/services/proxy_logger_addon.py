@@ -15,12 +15,14 @@ def _log(message: str) -> None:
 class ProxyLoggerAddon:
     def __init__(self) -> None:
         self._idle_lock = Lock()
+        self._flow_lock = Lock()
         self._last_activity = time.monotonic()
         self._last_idle_report = 0.0
         self._stop_event = Event()
         self._watcher: Thread | None = None
         self._upload_bytes = 0
         self._download_bytes = 0
+        self._live_flows: dict[str, object] = {}
 
     def load(self, loader) -> None:
         _log("日志插件已加载")
@@ -35,6 +37,36 @@ class ProxyLoggerAddon:
             self._last_activity = time.monotonic()
             self._last_idle_report = 0.0
 
+    def _track_flow(self, flow) -> None:
+        flow_id = getattr(flow, "id", "")
+        if not flow_id:
+            return
+        with self._flow_lock:
+            self._live_flows[flow_id] = flow
+
+    def _cleanup_flows(self) -> None:
+        with self._flow_lock:
+            self._live_flows = {
+                flow_id: flow
+                for flow_id, flow in self._live_flows.items()
+                if getattr(flow, "live", False)
+            }
+
+    def _kill_active_flows(self) -> None:
+        with self._flow_lock:
+            flows = list(self._live_flows.values())
+        killed = 0
+        for flow in flows:
+            if not getattr(flow, "killable", False):
+                continue
+            try:
+                flow.kill()
+                killed += 1
+            except Exception:
+                continue
+        self._cleanup_flows()
+        _log(f"kill active flows: {killed}")
+
     def _watch_idle_timeout(self) -> None:
         while not self._stop_event.wait(0.5):
             with self._idle_lock:
@@ -44,6 +76,7 @@ class ProxyLoggerAddon:
                 if now - self._last_idle_report < 60.0:
                     continue
                 self._last_idle_report = now
+            self._kill_active_flows()
             self._report_control_event("IDLE")
             _log("超过 60 秒没有数据流出")
 
@@ -144,8 +177,20 @@ class ProxyLoggerAddon:
         self._mark_activity()
         return None
 
+    def tcp_start(self, flow) -> None:
+        self._mark_activity()
+        self._track_flow(flow)
+        return None
+
+    def tcp_end(self, flow) -> None:
+        self._mark_activity()
+        self._cleanup_flows()
+        return None
+
     def request(self, flow: http.HTTPFlow) -> None:
         self._mark_activity()
+        self._track_flow(flow)
+        self._cleanup_flows()
         original_token = self._extract_bearer_token(flow)
         selected_token = self._get_selected_access_token()
         if selected_token:
@@ -158,6 +203,8 @@ class ProxyLoggerAddon:
 
     def response(self, flow: http.HTTPFlow) -> None:
         self._mark_activity()
+        self._track_flow(flow)
+        self._cleanup_flows()
         resp = flow.response
         if resp is None:
             return
@@ -166,11 +213,16 @@ class ProxyLoggerAddon:
 
     def error(self, flow: http.HTTPFlow) -> None:
         self._mark_activity()
+        self._track_flow(flow)
+        self._cleanup_flows()
         _log(f"错误: {flow.error}")
+
+    def websocket_end(self, flow: http.HTTPFlow) -> None:
+        self._mark_activity()
+        self._cleanup_flows()
 
     def done(self) -> None:
         self._stop_event.set()
         _log("代理插件退出")
-
 
 addons = [ProxyLoggerAddon()]
