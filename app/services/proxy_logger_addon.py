@@ -41,11 +41,11 @@ class ProxyLoggerAddon:
                 now = time.monotonic()
                 if now - self._last_activity < 5.0:
                     continue
-                if now - self._last_idle_report < 5.0:
+                if now - self._last_idle_report < 60.0:
                     continue
                 self._last_idle_report = now
             self._report_control_event("IDLE")
-            _log("超过 5 秒没有数据流出")
+            _log("超过 60 秒没有数据流出")
 
     def _get_selected_access_token(self) -> str:
         port_text = os.environ.get("AUTOLOAD_CONTROL_PORT", "").strip()
@@ -90,7 +90,6 @@ class ProxyLoggerAddon:
         return total
 
     def _report_traffic(self) -> None:
-        _log(f"流量: up={self._upload_bytes} down={self._download_bytes}")
         self._report_control_event(f"TRAFFIC {self._upload_bytes} {self._download_bytes}")
 
     def _report_access_token_used(self, access_token: str) -> None:
@@ -123,35 +122,27 @@ class ProxyLoggerAddon:
 
     def client_connected(self, *args, **kwargs) -> None:
         self._mark_activity()
-        layer = args[0] if args else None
-        client = getattr(layer, "client", None)
-        _log(f"客户端连接: {client}")
+        return None
 
     def client_disconnected(self, *args, **kwargs) -> None:
         self._mark_activity()
-        layer = args[0] if args else None
-        client = getattr(layer, "client", None)
-        _log(f"客户端断开: {client}")
+        return None
 
     def server_connect(self, *args, **kwargs) -> None:
         self._mark_activity()
-        data = args[0] if args else None
-        _log(f"上游连接: {getattr(data, 'address', None)}")
+        return None
 
     def server_connected(self, *args, **kwargs) -> None:
         self._mark_activity()
-        data = args[0] if args else None
-        _log(f"上游已连接: {getattr(data, 'server_conn', None)}")
+        return None
 
     def tls_established_client(self, *args, **kwargs) -> None:
         self._mark_activity()
-        data = args[0] if args else None
-        _log(f"客户端 TLS 已建立: {getattr(data, 'conn', None)}")
+        return None
 
     def tls_established_server(self, *args, **kwargs) -> None:
         self._mark_activity()
-        data = args[0] if args else None
-        _log(f"上游 TLS 已建立: {getattr(data, 'conn', None)}")
+        return None
 
     def request(self, flow: http.HTTPFlow) -> None:
         self._mark_activity()
@@ -164,11 +155,6 @@ class ProxyLoggerAddon:
             self._report_access_token_used(usage_token)
         self._upload_bytes += self._estimate_http_bytes(flow.request.headers, flow.request.raw_content)
         self._report_traffic()
-        req = flow.request
-        _log(f"请求: {req.method} {req.pretty_url}")
-        _log(f"请求头: {dict(req.headers)}")
-        if req.text:
-            _log(f"请求体: {req.text}")
 
     def response(self, flow: http.HTTPFlow) -> None:
         self._mark_activity()
@@ -177,10 +163,6 @@ class ProxyLoggerAddon:
             return
         self._download_bytes += self._estimate_http_bytes(resp.headers, resp.raw_content)
         self._report_traffic()
-        _log(f"响应: {resp.status_code} {flow.request.pretty_url}")
-        _log(f"响应头: {dict(resp.headers)}")
-        if resp.text:
-            _log(f"响应体: {resp.text}")
 
     def error(self, flow: http.HTTPFlow) -> None:
         self._mark_activity()

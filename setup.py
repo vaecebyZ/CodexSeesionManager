@@ -18,7 +18,7 @@ setup(
     version="1.0",
     description="Codex Session Manager",
     executables=[
-        Executable("main.py", target_name="codex_session.exe", base="Win32GUI"),
+        Executable("main.py", target_name="codex_session.exe", base="gui"),
     ],
     options={
         "build_exe": {

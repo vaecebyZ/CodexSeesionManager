@@ -5,6 +5,7 @@ import base64
 import hashlib
 from dataclasses import dataclass
 import os
+import locale
 import re
 import shutil
 import socket
@@ -37,6 +38,19 @@ class ProxyService:
 
     def _log(self, message: str) -> None:
         print(f"[ProxyService] {message}", flush=True)
+
+    def _decode_output(self, output: bytes | str | None) -> str:
+        if output is None:
+            return ""
+        if isinstance(output, str):
+            return output
+        preferred_encoding = locale.getpreferredencoding(False) or "utf-8"
+        for encoding in (preferred_encoding, "utf-8", "mbcs", "cp936"):
+            try:
+                return output.decode(encoding)
+            except (LookupError, UnicodeDecodeError):
+                continue
+        return output.decode("utf-8", errors="replace")
 
     def _app_root(self) -> Path:
         if getattr(sys, "frozen", False):
@@ -78,9 +92,9 @@ class ProxyService:
         result = subprocess.run(
             ["icacls", str(target_path), "/grant", f"{user}:(RX)"],
             capture_output=True,
-            text=True,
         )
-        self._log(f"icacls 输出: {result.stdout.strip() or result.stderr.strip()}")
+        output = self._decode_output(result.stdout).strip() or self._decode_output(result.stderr).strip()
+        self._log(f"icacls output: {output}")
         return True, ""
 
     def find_available_port(self, start_port: int | None = None, max_tries: int = 100) -> int:
@@ -106,9 +120,9 @@ class ProxyService:
             "Root",
             str(cert_path),
         ]
-        result = subprocess.run(command, capture_output=True, text=True)
+        result = subprocess.run(command, capture_output=True)
         if result.returncode != 0:
-            message = result.stderr.strip() or result.stdout.strip() or "证书安装失败"
+            message = self._decode_output(result.stderr).strip() or self._decode_output(result.stdout).strip() or "证书安装失败"
             return False, message
         self._log(f"证书安装成功: {cert_path}")
         return True, "证书已安装到当前用户的受信任根证书存储。"
@@ -151,7 +165,6 @@ class ProxyService:
                 ),
             ],
             capture_output=True,
-            text=True,
         )
         return result.returncode == 0
     def _resolve_mitmdump_command(self) -> list[str]:

@@ -38,10 +38,6 @@ class ChatGPTUsageFetcher:
     def fetch(self, access_token: str, account_id: str = "") -> UsageFetchResult:
         if not access_token:
             return UsageFetchResult(message="access_token 为空")
-
-        self._log(
-            f"请求: GET {self.endpoint} account_id={account_id or '-'} access_token={self._redact(access_token)}"
-        )
         headers = {
             "user-agent": "codex-tui/0.121.0 (Windows 10.0.22631; x86_64) unknown (codex-tui; 0.121.0)",
             "authorization": f"Bearer {access_token}",
@@ -55,7 +51,6 @@ class ChatGPTUsageFetcher:
         try:
             with urlopen(request, timeout=15) as response:
                 body = response.read().decode("utf-8")
-                self._log(f"响应状态: {getattr(response, 'status', 'unknown')} 长度={len(body)}")
                 payload = json.loads(body)
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
             self._log(f"请求失败: {exc}")
@@ -69,12 +64,6 @@ class ChatGPTUsageFetcher:
         parsed_account_id = self._summarize_string_field(payload, "account_id")
         email = self._summarize_string_field(payload, "email")
         quota_refresh_time_5h, quota_refresh_time_7d = self._summarize_quota_refresh_times(payload)
-        if isinstance(payload, dict):
-            self._log(f"响应键: {', '.join(sorted(payload.keys()))}")
-        self._log(
-            f"解析额度: account_id={account_id or '-'} quota={quota} plan_type={plan_type or '未知'} "
-            f"quota_refresh_time_5h={quota_refresh_time_5h or '-'} quota_refresh_time_7d={quota_refresh_time_7d or '-'}"
-        )
         raw = payload if isinstance(payload, dict) else None
         return UsageFetchResult(
             quota=quota,

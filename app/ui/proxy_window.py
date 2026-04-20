@@ -936,14 +936,11 @@ class ProxyWindow:
             "set NO_PROXY=localhost,127.0.0.1\r\n"
             f'"{exe}"\r\n'
         )
-        current_dir = str(Path(__file__).resolve().parents[2])
+        current_dir = str(exe.parent)
         with tempfile.NamedTemporaryFile("w", suffix=".bat", delete=False, encoding="utf-8", newline="\r\n") as batch_file:
             batch_file.write(script)
             batch_path = batch_file.name
-        print(f"[ProxyWindow] 启动目录: {current_dir}", flush=True)
-        print(f"[ProxyWindow] 临时批处理: {batch_path}", flush=True)
-        print("[ProxyWindow] 批处理内容:", flush=True)
-        print(script, end="", flush=True)
+        print(f"[ProxyWindow] 启动外部程序: {exe.name}", flush=True)
         subprocess.Popen(
             ["cmd.exe", "/k", batch_path, current_dir],
             creationflags=subprocess.CREATE_NEW_CONSOLE,

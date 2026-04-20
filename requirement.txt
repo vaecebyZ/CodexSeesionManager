@@ -1,4 +1,4 @@
-cx-Freeze
+cx-Freeze>=8,<9
 mitmproxy==11.0.2
 psutil==7.2.2
 websocket-client==1.9.0

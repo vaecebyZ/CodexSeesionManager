@@ -66,9 +66,7 @@ class AuthUsageService:
             return
         self._stop_event.clear()
         self._refresh_event.clear()
-        self._log(
-            f"后台线程启动: 首次 {self.initial_delay_seconds}s 后刷新，之后每次随机 25~35s 刷新一次"
-        )
+        self._log(f"后台线程启动: 首次 {self.initial_delay_seconds}s 后刷新")
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -77,7 +75,6 @@ class AuthUsageService:
         self._refresh_event.set()
 
     def request_refresh(self) -> None:
-        self._log("收到立即刷新请求")
         self._refresh_event.set()
 
     def quota_for(self, refresh_token: str) -> str:
@@ -165,7 +162,6 @@ class AuthUsageService:
         previous = {key: os.environ.get(key) for key in env_keys}
         for key in env_keys:
             os.environ[key] = normalized
-        self._log(f"额度请求使用二级代理: {normalized}")
         try:
             yield
         finally:
@@ -184,9 +180,7 @@ class AuthUsageService:
                 return
             self._refresh_once()
             while not self._stop_event.is_set():
-                interval_seconds = self._next_refresh_interval()
-                self._log(f"下一轮额度刷新随机间隔: {interval_seconds:.1f}s")
-                if self._wait_for_refresh(interval_seconds):
+                if self._wait_for_refresh(self._next_refresh_interval()):
                     return
                 self._refresh_once()
         except Exception as exc:
@@ -210,7 +204,6 @@ class AuthUsageService:
             self._log(f"读取授权文件失败: {exc}")
             return
         if not rows:
-            self._log("未找到可刷新授权文件")
             return
 
         with self._quota_lock:
@@ -230,7 +223,6 @@ class AuthUsageService:
             refresh_rows: list[tuple[str, str, str]] = []
             for row in rows:
                 if not row.access_token:
-                    self._log(f"跳过空 access_token: refresh_token={row.refresh_token}")
                     continue
                 refresh_rows.append((row.refresh_token, row.account_id, row.access_token))
             if not refresh_rows:
@@ -259,7 +251,6 @@ class AuthUsageService:
 
         if changed:
             if self._on_change is not None:
-                self._log("额度对象已入队，通知 UI 刷新")
                 self._on_change()
 
     def _refresh_row(
@@ -274,7 +265,6 @@ class AuthUsageService:
         quota_refresh_time_cache: dict[str, str],
         quota_refresh_time_7d_cache: dict[str, str],
     ) -> bool:
-        self._log(f"刷新额度: account_id={account_id} refresh_token={refresh_token}")
         result = self.fetcher.fetch(access_token, account_id)
         if not result.quota:
             if result.message:
@@ -311,5 +301,4 @@ class AuthUsageService:
                 self._on_quota_change()
             except Exception as exc:
                 self._log(f"额度刷新回调异常: {exc}\n{traceback.format_exc()}")
-        self._log(f"额度更新: refresh_token={refresh_token} quota={result.quota}")
         return True
