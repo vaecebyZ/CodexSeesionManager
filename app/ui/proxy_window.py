@@ -401,6 +401,7 @@ class ProxyWindow:
         with self._auto_load_lock:
             if not self._auto_load_enabled:
                 return
+            current_refresh_token = self._auto_load_target_refresh_token
         rows = self.auth_sync_service.list_auth_rows()
         if not rows:
             self._set_auto_load_target("", "")
@@ -408,10 +409,11 @@ class ProxyWindow:
             return
         row = max(rows, key=lambda item: (self._quota_priority(item.quota), item.refresh_token))
         self._set_auto_load_target(row.refresh_token, row.access_token)
-        print(
-            f"[AutoLoad] 负载目标: account_id={row.account_id} refresh_token={row.refresh_token} quota={row.quota}",
-            flush=True,
-        )
+        if row.refresh_token != current_refresh_token:
+            print(
+                f"[AutoLoad] 负载目标: account_id={row.account_id} refresh_token={row.refresh_token} quota={row.quota}",
+                flush=True,
+            )
         self.refresh_auth_files(update_status=False)
 
     def _restart_proxy_server_async(self) -> None:

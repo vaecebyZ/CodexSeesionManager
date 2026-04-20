@@ -18,6 +18,7 @@ class ProxyLoggerAddon:
         self._flow_lock = Lock()
         self._last_activity = time.monotonic()
         self._last_idle_report = 0.0
+        self._idle_kill_sent = False
         self._stop_event = Event()
         self._watcher: Thread | None = None
         self._upload_bytes = 0
@@ -36,6 +37,7 @@ class ProxyLoggerAddon:
         with self._idle_lock:
             self._last_activity = time.monotonic()
             self._last_idle_report = 0.0
+            self._idle_kill_sent = False
 
     def _track_flow(self, flow) -> None:
         flow_id = getattr(flow, "id", "")
@@ -73,12 +75,15 @@ class ProxyLoggerAddon:
                 now = time.monotonic()
                 if now - self._last_activity < 5.0:
                     continue
-                if now - self._last_idle_report < 60.0:
+                if self._idle_kill_sent:
+                    continue
+                if now - self._last_idle_report < 180.0:
                     continue
                 self._last_idle_report = now
+                self._idle_kill_sent = True
             self._kill_active_flows()
             self._report_control_event("IDLE")
-            _log("超过 60 秒没有数据流出")
+            _log("超过 180 秒没有数据流出")
 
     def _get_selected_access_token(self) -> str:
         port_text = os.environ.get("AUTOLOAD_CONTROL_PORT", "").strip()
@@ -158,7 +163,7 @@ class ProxyLoggerAddon:
         return None
 
     def client_disconnected(self, *args, **kwargs) -> None:
-        self._mark_activity()
+        self._cleanup_flows()
         return None
 
     def server_connect(self, *args, **kwargs) -> None:
@@ -183,7 +188,6 @@ class ProxyLoggerAddon:
         return None
 
     def tcp_end(self, flow) -> None:
-        self._mark_activity()
         self._cleanup_flows()
         return None
 
@@ -212,13 +216,11 @@ class ProxyLoggerAddon:
         self._report_traffic()
 
     def error(self, flow: http.HTTPFlow) -> None:
-        self._mark_activity()
         self._track_flow(flow)
         self._cleanup_flows()
         _log(f"错误: {flow.error}")
 
     def websocket_end(self, flow: http.HTTPFlow) -> None:
-        self._mark_activity()
         self._cleanup_flows()
 
     def done(self) -> None:
