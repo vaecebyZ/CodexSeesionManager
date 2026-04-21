@@ -214,14 +214,14 @@ class ProxyLoggerAddon:
         return data.decode("utf-8", errors="ignore").strip()
 
     def handle_ping_pong_log(self) -> None:
-        if self._consume_pending_kill_flag():
+        if self._should_disconnect_on_pingpong():
             killed = self._kill_active_flows()
             if killed > 0:
                 _log(f"ping/pong 命中，已断开 {killed} 个代理连接")
             else:
                 _log("ping/pong 命中，但未找到可断开的代理连接")
 
-    def _consume_pending_kill_flag(self) -> bool:
+    def _should_disconnect_on_pingpong(self) -> bool:
         return self._send_control_message("PINGPONG", read_response=True) == "1"
 
     def client_connected(self, *args, **kwargs) -> None:

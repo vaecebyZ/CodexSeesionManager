@@ -65,8 +65,6 @@ class ProxyWindow:
         self._upstream_proxy = self.service.config.upstream_proxy
         self._auto_load_target_refresh_token = ""
         self._auto_load_target_access_token = ""
-        self._proxy_kill_pending = False
-        self._proxy_kill_pending_access_token = ""
         self._auto_load_control_stop = Event()
         self._auto_load_control_socket: socket.socket | None = None
         self._auto_load_control_port = self._start_auto_load_control_server()
@@ -80,6 +78,8 @@ class ProxyWindow:
         self._ui_queue: Queue[Callable[[], None]] = Queue()
         self._last_install_rows_signature: tuple[tuple[str, str, str, str], ...] | None = None
         self._last_auth_rows_signature: tuple[tuple[bool, bool, str, str, str, str, str, int], ...] | None = None
+        self._auto_load_snapshot_target_refresh_token = ""
+        self._auto_load_snapshot: dict[str, float] = {}
 
         self._build_ui()
         self.root.after(50, self._drain_ui_queue)
@@ -399,7 +399,7 @@ class ProxyWindow:
             self._recompute_auto_load_target()
             return
         self._set_auto_load_target("", "")
-        self._clear_proxy_kill_pending()
+        self._clear_auto_load_snapshot()
         self.refresh_auth_files(update_status=False)
 
     def _recompute_auto_load_target(self) -> None:
@@ -408,28 +408,81 @@ class ProxyWindow:
                 return
             current_refresh_token = self._auto_load_target_refresh_token
             current_access_token = self._auto_load_target_access_token
-            pending_access_token = self._proxy_kill_pending_access_token
+            snapshot_exists = bool(self._auto_load_snapshot)
         rows = self.auth_sync_service.list_auth_rows()
         if not rows:
             self._set_auto_load_target("", "")
-            self._clear_proxy_kill_pending()
+            self._clear_auto_load_snapshot()
             print("[AutoLoad] 当前没有可选授权文件", flush=True)
             return
         row = max(rows, key=lambda item: (self._quota_priority(item.quota), item.refresh_token))
+        target_changed = row.refresh_token != current_refresh_token or row.access_token != current_access_token
         self._set_auto_load_target(row.refresh_token, row.access_token)
-        if row.refresh_token != current_refresh_token:
+        if target_changed:
             print(
                 f"[AutoLoad] 负载目标: account_id={row.account_id} refresh_token={row.refresh_token} quota={row.quota}",
                 flush=True,
             )
-        if row.access_token and row.access_token == pending_access_token:
-            self._clear_proxy_kill_pending()
-        elif current_access_token and row.access_token and row.access_token != current_access_token:
-            self._mark_proxy_kill_pending(row.access_token)
-            print("[AutoLoad] 负载对象已切换，等待 WebSocket ping/pong 后断开旧连接", flush=True)
-        else:
-            self._clear_proxy_kill_pending()
+        if not snapshot_exists:
+            self._capture_auto_load_snapshot(rows, row.refresh_token)
         self.refresh_auth_files(update_status=False)
+
+    def _capture_auto_load_snapshot(self, rows: list[AuthFileRow], target_refresh_token: str) -> None:
+        snapshot: dict[str, float] = {}
+        for row in rows:
+            score = self._quota_priority(row.quota)
+            if score >= 0:
+                snapshot[row.refresh_token] = score
+        with self._auto_load_lock:
+            self._auto_load_snapshot_target_refresh_token = target_refresh_token
+            self._auto_load_snapshot = snapshot
+
+    def _clear_auto_load_snapshot(self) -> None:
+        with self._auto_load_lock:
+            self._auto_load_snapshot_target_refresh_token = ""
+            self._auto_load_snapshot = {}
+
+    def _should_disconnect_on_pingpong(self) -> bool:
+        with self._auto_load_lock:
+            if not self._auto_load_enabled:
+                return False
+            snapshot_target_refresh_token = self._auto_load_snapshot_target_refresh_token
+            snapshot = dict(self._auto_load_snapshot)
+        rows = self.auth_sync_service.list_auth_rows()
+        if not rows:
+            return False
+        elected_row = max(rows, key=lambda item: (self._quota_priority(item.quota), item.refresh_token))
+        elected_refresh_token = elected_row.refresh_token
+        if not snapshot:
+            self._capture_auto_load_snapshot(rows, elected_refresh_token)
+            return False
+
+        should_disconnect = snapshot_target_refresh_token != elected_refresh_token
+        for row in rows:
+            if row.refresh_token == elected_refresh_token:
+                continue
+            snapshot_score = snapshot.get(row.refresh_token)
+            if snapshot_score is None:
+                continue
+            current_score = self._quota_priority(row.quota)
+            if current_score < 0:
+                continue
+            if current_score + 1e-9 < snapshot_score:
+                print(
+                    "[AutoLoad] ping/pong 命中非目标额度下降: ",
+                    f"refresh_token={row.refresh_token} snapshot={snapshot_score} current={current_score}",
+                    flush=True,
+                )
+                should_disconnect = True
+                break
+
+        self._capture_auto_load_snapshot(rows, elected_refresh_token)
+        return should_disconnect
+
+    def _set_auto_load_target(self, refresh_token: str, access_token: str) -> None:
+        with self._auto_load_lock:
+            self._auto_load_target_refresh_token = refresh_token
+            self._auto_load_target_access_token = access_token
 
     def _restart_proxy_server_async(self) -> None:
         with self._proxy_restart_lock:
@@ -461,24 +514,6 @@ class ProxyWindow:
         with self._auto_load_lock:
             self._auto_load_target_refresh_token = refresh_token
             self._auto_load_target_access_token = access_token
-
-    def _mark_proxy_kill_pending(self, access_token: str) -> None:
-        with self._auto_load_lock:
-            self._proxy_kill_pending = True
-            self._proxy_kill_pending_access_token = access_token
-
-    def _clear_proxy_kill_pending(self) -> None:
-        with self._auto_load_lock:
-            self._proxy_kill_pending = False
-            self._proxy_kill_pending_access_token = ""
-
-    def _consume_proxy_kill_pending(self) -> bool:
-        with self._auto_load_lock:
-            if not self._proxy_kill_pending:
-                return False
-            self._proxy_kill_pending = False
-            self._proxy_kill_pending_access_token = ""
-            return True
 
     def _persist_config(self) -> None:
         try:
@@ -565,7 +600,7 @@ class ProxyWindow:
                         self._post_ui(self._recompute_auto_load_target)
                         continue
                     if payload == "PINGPONG":
-                        conn.sendall(("1\n" if self._consume_proxy_kill_pending() else "0\n").encode("utf-8"))
+                        conn.sendall(("1\n" if self._should_disconnect_on_pingpong() else "0\n").encode("utf-8"))
                         continue
                     if payload == "IDLE_TIMEOUT":
                         continue

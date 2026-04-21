@@ -304,6 +304,19 @@ class ProxyService:
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
+        try:
+            parent.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+        try:
+            parent.wait(timeout=3)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+            try:
+                parent.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
     def _stop_matching_processes(self) -> None:
         for proc in psutil.process_iter(["pid", "name", "cmdline"]):
             try:

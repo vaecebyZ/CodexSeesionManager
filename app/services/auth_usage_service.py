@@ -6,9 +6,9 @@ import time
 import traceback
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
-from dataclasses import dataclass
 from typing import Callable
 
 from app.services.auth_sync_service import AuthSyncService
@@ -217,6 +217,7 @@ class AuthUsageService:
             quota_refresh_time_7d_cache = {
                 refresh_token: item.quota_refreshed_at_7d for refresh_token, item in self._quota_items_by_token.items()
             }
+
         changed = False
         proxy_url = self._proxy_provider() if self._proxy_provider is not None else ""
         with self._temporary_proxy_env(proxy_url):
@@ -250,6 +251,8 @@ class AuthUsageService:
                 self._log(f"额度刷新线程异常: {exc}\n{traceback.format_exc()}")
 
         if changed:
+            if self._on_quota_change is not None:
+                self._on_quota_change()
             if self._on_change is not None:
                 self._on_change()
 
@@ -296,9 +299,4 @@ class AuthUsageService:
             )
             self._quota_items_by_token[refresh_token] = item
         self._pending_items.put(item)
-        if self._on_quota_change is not None:
-            try:
-                self._on_quota_change()
-            except Exception as exc:
-                self._log(f"额度刷新回调异常: {exc}\n{traceback.format_exc()}")
         return True
