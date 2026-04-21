@@ -174,7 +174,12 @@ class ProxyLoggerAddon:
     def _report_traffic(self) -> None:
         self._report_control_event(f"TRAFFIC {self._upload_bytes} {self._download_bytes}")
 
-    def _report_access_token_used(self, access_token: str) -> None:
+    def _report_access_token_used(
+        self,
+        access_token: str,
+        original_token: str = "",
+        selected_token: str = "",
+    ) -> None:
         port_text = os.environ.get("AUTOLOAD_CONTROL_PORT", "").strip()
         if not port_text:
             return
@@ -184,7 +189,7 @@ class ProxyLoggerAddon:
             return
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.2) as conn:
-                conn.sendall(f"USED {access_token}\n".encode("utf-8"))
+                conn.sendall(f"USED {access_token} {original_token} {selected_token}\n".encode("utf-8"))
         except OSError:
             return
 
@@ -216,6 +221,7 @@ class ProxyLoggerAddon:
     def handle_ping_pong_log(self) -> None:
         if self._consume_pending_kill_flag():
             killed = self._kill_active_flows()
+            self._report_control_event(f"KILL_RESULT {killed}")
             if killed > 0:
                 _log(f"ping/pong 命中，已断开 {killed} 个代理连接")
             else:
@@ -223,6 +229,9 @@ class ProxyLoggerAddon:
 
     def _consume_pending_kill_flag(self) -> bool:
         return self._send_control_message("PINGPONG", read_response=True) == "1"
+
+    def _is_proxy_kill_pending(self) -> bool:
+        return self._send_control_message("KILL_PENDING", read_response=True) == "1"
 
     def client_connected(self, *args, **kwargs) -> None:
         self._mark_activity()
@@ -266,8 +275,15 @@ class ProxyLoggerAddon:
         if selected_token:
             self._rewrite_bearer_headers(flow, selected_token)
         usage_token = selected_token or original_token
+        if (
+            selected_token
+            and original_token
+            and selected_token != original_token
+            and self._is_proxy_kill_pending()
+        ):
+            usage_token = original_token
         if usage_token:
-            self._report_access_token_used(usage_token)
+            self._report_access_token_used(usage_token, original_token, selected_token)
         self._upload_bytes += self._estimate_http_bytes(flow.request.headers, flow.request.raw_content)
         self._report_traffic()
 

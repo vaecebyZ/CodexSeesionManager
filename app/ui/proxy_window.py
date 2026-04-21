@@ -23,6 +23,9 @@ from tkinter import messagebox, ttk
 from app.services.proxy_service import ProxyConfig, ProxyService
 
 
+_AUTO_LOAD_MISMATCH_WINDOW_SECONDS = 60.0
+
+
 @dataclass
 class CodexInstallRow:
     name: str
@@ -65,8 +68,13 @@ class ProxyWindow:
         self._upstream_proxy = self.service.config.upstream_proxy
         self._auto_load_target_refresh_token = ""
         self._auto_load_target_access_token = ""
+        self._last_used_access_token = ""
         self._proxy_kill_pending = False
         self._proxy_kill_pending_access_token = ""
+        self._proxy_kill_pending_used_access_token = ""
+        self._proxy_kill_pending_until = 0.0
+        self._proxy_kill_next_allowed_at = 0.0
+        self._proxy_kill_attempt_in_flight = False
         self._auto_load_control_stop = Event()
         self._auto_load_control_socket: socket.socket | None = None
         self._auto_load_control_port = self._start_auto_load_control_server()
@@ -359,12 +367,13 @@ class ProxyWindow:
         )
         return True
 
-    def _on_access_token_hit(self, access_token: str) -> None:
-        if not self.auth_sync_service.increment_traffic_by_access_token(access_token):
-            return
-        self._schedule_refresh_traffic()
-
-    def _on_auto_load_access_token_used(self, access_token: str) -> None:
+    def _on_auto_load_access_token_used(
+        self,
+        access_token: str,
+        original_access_token: str = "",
+        selected_access_token: str = "",
+    ) -> None:
+        self._update_proxy_kill_pending_for_used_token(access_token, original_access_token, selected_access_token)
         if not self.auth_sync_service.increment_traffic_by_access_token(access_token):
             return
         self._schedule_refresh_traffic()
@@ -407,8 +416,6 @@ class ProxyWindow:
             if not self._auto_load_enabled:
                 return
             current_refresh_token = self._auto_load_target_refresh_token
-            current_access_token = self._auto_load_target_access_token
-            pending_access_token = self._proxy_kill_pending_access_token
         rows = self.auth_sync_service.list_auth_rows()
         if not rows:
             self._set_auto_load_target("", "")
@@ -422,13 +429,7 @@ class ProxyWindow:
                 f"[AutoLoad] 负载目标: account_id={row.account_id} refresh_token={row.refresh_token} quota={row.quota}",
                 flush=True,
             )
-        if row.access_token and row.access_token == pending_access_token:
-            self._clear_proxy_kill_pending()
-        elif current_access_token and row.access_token and row.access_token != current_access_token:
-            self._mark_proxy_kill_pending(row.access_token)
-            print("[AutoLoad] 负载对象已切换，等待 WebSocket ping/pong 后断开旧连接", flush=True)
-        else:
-            self._clear_proxy_kill_pending()
+        self._sync_proxy_kill_pending_with_target(row.access_token)
         self.refresh_auth_files(update_status=False)
 
     def _restart_proxy_server_async(self) -> None:
@@ -462,23 +463,116 @@ class ProxyWindow:
             self._auto_load_target_refresh_token = refresh_token
             self._auto_load_target_access_token = access_token
 
-    def _mark_proxy_kill_pending(self, access_token: str) -> None:
+    def _update_proxy_kill_pending_for_used_token(
+        self,
+        used_access_token: str,
+        original_access_token: str = "",
+        selected_access_token: str = "",
+    ) -> None:
+        used_access_token = used_access_token.strip()
+        if not used_access_token:
+            return
+        original_access_token = original_access_token.strip()
+        selected_access_token = selected_access_token.strip()
+        drift_access_token = original_access_token or selected_access_token or used_access_token
+        mismatch_detected = False
+        mismatch_resolved = False
         with self._auto_load_lock:
-            self._proxy_kill_pending = True
-            self._proxy_kill_pending_access_token = access_token
+            self._last_used_access_token = drift_access_token
+            if not self._auto_load_enabled:
+                self._clear_proxy_kill_pending_locked()
+                return
+            target_access_token = self._auto_load_target_access_token.strip()
+            if not target_access_token:
+                self._clear_proxy_kill_pending_locked()
+                return
+            if drift_access_token == target_access_token:
+                mismatch_resolved = self._proxy_kill_pending
+                self._clear_proxy_kill_pending_locked()
+            else:
+                state_changed = (
+                    not self._proxy_kill_pending
+                    or self._proxy_kill_pending_access_token != target_access_token
+                    or self._proxy_kill_pending_used_access_token != drift_access_token
+                )
+                self._proxy_kill_pending = True
+                self._proxy_kill_pending_access_token = target_access_token
+                self._proxy_kill_pending_used_access_token = drift_access_token
+                self._proxy_kill_pending_until = time.monotonic() + _AUTO_LOAD_MISMATCH_WINDOW_SECONDS
+                if state_changed:
+                    self._proxy_kill_attempt_in_flight = False
+                    mismatch_detected = True
+        if mismatch_resolved:
+            print("[AutoLoad] 实际消耗 token 已与当前选举目标一致，停止等待断连", flush=True)
+            return
+        if mismatch_detected:
+            print(
+                "[AutoLoad] 检测到 token 消耗未命中当前选举目标，等待下一次 WebSocket ping/pong 断开旧连接",
+                flush=True,
+            )
+
+    def _sync_proxy_kill_pending_with_target(self, target_access_token: str) -> None:
+        with self._auto_load_lock:
+            if not self._auto_load_enabled or not target_access_token:
+                self._clear_proxy_kill_pending_locked()
+                return
+            if self._last_used_access_token and self._last_used_access_token == target_access_token:
+                self._clear_proxy_kill_pending_locked()
+                return
+            if not self._proxy_kill_pending:
+                return
+            if self._is_proxy_kill_pending_locked():
+                return
+            self._clear_proxy_kill_pending_locked()
 
     def _clear_proxy_kill_pending(self) -> None:
         with self._auto_load_lock:
-            self._proxy_kill_pending = False
-            self._proxy_kill_pending_access_token = ""
+            self._clear_proxy_kill_pending_locked()
 
     def _consume_proxy_kill_pending(self) -> bool:
         with self._auto_load_lock:
-            if not self._proxy_kill_pending:
+            if not self._is_proxy_kill_pending_locked():
                 return False
-            self._proxy_kill_pending = False
-            self._proxy_kill_pending_access_token = ""
+            if self._proxy_kill_attempt_in_flight:
+                return False
+            now = time.monotonic()
+            if now < self._proxy_kill_next_allowed_at:
+                return False
+            self._proxy_kill_attempt_in_flight = True
+            self._proxy_kill_next_allowed_at = now + _AUTO_LOAD_MISMATCH_WINDOW_SECONDS
             return True
+
+    def _record_proxy_kill_result(self, killed: int) -> None:
+        with self._auto_load_lock:
+            self._proxy_kill_attempt_in_flight = False
+            if killed > 0:
+                self._clear_proxy_kill_pending_locked(preserve_cooldown=True)
+                return
+            if self._proxy_kill_pending:
+                self._proxy_kill_next_allowed_at = 0.0
+
+    def _is_proxy_kill_pending(self) -> bool:
+        with self._auto_load_lock:
+            return self._is_proxy_kill_pending_locked()
+
+    def _is_proxy_kill_pending_locked(self) -> bool:
+        if not self._proxy_kill_pending:
+            return False
+        if self._proxy_kill_pending_until <= 0:
+            return True
+        if time.monotonic() <= self._proxy_kill_pending_until:
+            return True
+        self._clear_proxy_kill_pending_locked()
+        return False
+
+    def _clear_proxy_kill_pending_locked(self, preserve_cooldown: bool = False) -> None:
+        next_allowed_at = self._proxy_kill_next_allowed_at if preserve_cooldown else 0.0
+        self._proxy_kill_pending = False
+        self._proxy_kill_pending_access_token = ""
+        self._proxy_kill_pending_used_access_token = ""
+        self._proxy_kill_pending_until = 0.0
+        self._proxy_kill_next_allowed_at = next_allowed_at
+        self._proxy_kill_attempt_in_flight = False
 
     def _persist_config(self) -> None:
         try:
@@ -543,13 +637,27 @@ class ProxyWindow:
                 try:
                     conn.settimeout(0.1)
                     try:
-                        payload = conn.recv(4096).decode("utf-8", errors="ignore").strip()
+                        payload = conn.recv(65536).decode("utf-8", errors="ignore").strip()
                     except socket.timeout:
                         payload = ""
                     if payload.startswith("USED "):
-                        token = payload.removeprefix("USED ").strip()
+                        parts = payload.split()
+                        token = parts[1] if len(parts) >= 2 else ""
+                        original_token = parts[2] if len(parts) >= 3 else ""
+                        selected_token = parts[3] if len(parts) >= 4 else ""
                         if token:
-                            self._post_ui(lambda value=token: self._on_auto_load_access_token_used(value))
+                            self._post_ui(
+                                lambda value=token, original=original_token, selected=selected_token:
+                                self._on_auto_load_access_token_used(value, original, selected)
+                            )
+                        continue
+                    if payload.startswith("KILL_RESULT "):
+                        parts = payload.split()
+                        try:
+                            killed = int(parts[1]) if len(parts) >= 2 else 0
+                        except ValueError:
+                            killed = 0
+                        self._post_ui(lambda value=killed: self._record_proxy_kill_result(value))
                         continue
                     if payload.startswith("TRAFFIC "):
                         parts = payload.split()
@@ -566,6 +674,9 @@ class ProxyWindow:
                         continue
                     if payload == "PINGPONG":
                         conn.sendall(("1\n" if self._consume_proxy_kill_pending() else "0\n").encode("utf-8"))
+                        continue
+                    if payload == "KILL_PENDING":
+                        conn.sendall(("1\n" if self._is_proxy_kill_pending() else "0\n").encode("utf-8"))
                         continue
                     if payload == "IDLE_TIMEOUT":
                         continue
