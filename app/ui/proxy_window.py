@@ -72,7 +72,6 @@ class ProxyWindow:
         self._proxy_kill_pending = False
         self._proxy_kill_pending_access_token = ""
         self._proxy_kill_pending_used_access_token = ""
-        self._proxy_kill_pending_until = 0.0
         self._proxy_kill_next_allowed_at = 0.0
         self._proxy_kill_attempt_in_flight = False
         self._auto_load_control_stop = Event()
@@ -100,8 +99,6 @@ class ProxyWindow:
             )
         )
         self.auth_usage_service.set_proxy_provider(self._get_proxy_for_usage_request)
-        self.service.set_idle_timeout_callback(self._on_proxy_idle_timeout)
-        self.service.set_traffic_callback(self._on_proxy_traffic_update)
         self.auth_sync_service.start()
         self.auth_usage_service.start()
         self._center_window(960, 660)
@@ -367,26 +364,11 @@ class ProxyWindow:
         )
         return True
 
-    def _on_auto_load_access_token_used(
-        self,
-        access_token: str,
-        original_access_token: str = "",
-        selected_access_token: str = "",
-    ) -> None:
-        self._update_proxy_kill_pending_for_used_token(access_token, original_access_token, selected_access_token)
+    def _on_auto_load_access_token_used(self, access_token: str) -> None:
+        self._update_proxy_kill_pending_for_used_token(access_token)
         if not self.auth_sync_service.increment_traffic_by_access_token(access_token):
             return
         self._schedule_refresh_traffic()
-
-    def _on_proxy_idle_timeout(self) -> None:
-        with self._auto_load_lock:
-            enabled = self._auto_load_enabled
-        if not enabled:
-            return
-        try:
-            self._post_ui(self._recompute_auto_load_target)
-        except tk.TclError:
-            pass
 
     def _on_proxy_traffic_update(self, up_bytes: int, down_bytes: int) -> None:
         try:
@@ -416,6 +398,7 @@ class ProxyWindow:
             if not self._auto_load_enabled:
                 return
             current_refresh_token = self._auto_load_target_refresh_token
+            current_access_token = self._auto_load_target_access_token
         rows = self.auth_sync_service.list_auth_rows()
         if not rows:
             self._set_auto_load_target("", "")
@@ -423,14 +406,20 @@ class ProxyWindow:
             print("[AutoLoad] 当前没有可选授权文件", flush=True)
             return
         row = max(rows, key=lambda item: (self._quota_priority(item.quota), item.refresh_token))
+        target_changed = row.refresh_token != current_refresh_token or row.access_token != current_access_token
         self._set_auto_load_target(row.refresh_token, row.access_token)
-        if row.refresh_token != current_refresh_token:
+        if target_changed:
             print(
                 f"[AutoLoad] 负载目标: account_id={row.account_id} refresh_token={row.refresh_token} quota={row.quota}",
                 flush=True,
             )
         self._sync_proxy_kill_pending_with_target(row.access_token)
         self.refresh_auth_files(update_status=False)
+
+    def _set_auto_load_target(self, refresh_token: str, access_token: str) -> None:
+        with self._auto_load_lock:
+            self._auto_load_target_refresh_token = refresh_token
+            self._auto_load_target_access_token = access_token
 
     def _restart_proxy_server_async(self) -> None:
         with self._proxy_restart_lock:
@@ -458,27 +447,14 @@ class ProxyWindow:
             except tk.TclError:
                 pass
 
-    def _set_auto_load_target(self, refresh_token: str, access_token: str) -> None:
-        with self._auto_load_lock:
-            self._auto_load_target_refresh_token = refresh_token
-            self._auto_load_target_access_token = access_token
-
-    def _update_proxy_kill_pending_for_used_token(
-        self,
-        used_access_token: str,
-        original_access_token: str = "",
-        selected_access_token: str = "",
-    ) -> None:
+    def _update_proxy_kill_pending_for_used_token(self, used_access_token: str) -> None:
         used_access_token = used_access_token.strip()
         if not used_access_token:
             return
-        original_access_token = original_access_token.strip()
-        selected_access_token = selected_access_token.strip()
-        drift_access_token = original_access_token or selected_access_token or used_access_token
         mismatch_detected = False
         mismatch_resolved = False
         with self._auto_load_lock:
-            self._last_used_access_token = drift_access_token
+            self._last_used_access_token = used_access_token
             if not self._auto_load_enabled:
                 self._clear_proxy_kill_pending_locked()
                 return
@@ -486,19 +462,18 @@ class ProxyWindow:
             if not target_access_token:
                 self._clear_proxy_kill_pending_locked()
                 return
-            if drift_access_token == target_access_token:
+            if used_access_token == target_access_token:
                 mismatch_resolved = self._proxy_kill_pending
                 self._clear_proxy_kill_pending_locked()
             else:
                 state_changed = (
                     not self._proxy_kill_pending
                     or self._proxy_kill_pending_access_token != target_access_token
-                    or self._proxy_kill_pending_used_access_token != drift_access_token
+                    or self._proxy_kill_pending_used_access_token != used_access_token
                 )
                 self._proxy_kill_pending = True
                 self._proxy_kill_pending_access_token = target_access_token
-                self._proxy_kill_pending_used_access_token = drift_access_token
-                self._proxy_kill_pending_until = time.monotonic() + _AUTO_LOAD_MISMATCH_WINDOW_SECONDS
+                self._proxy_kill_pending_used_access_token = used_access_token
                 if state_changed:
                     self._proxy_kill_attempt_in_flight = False
                     mismatch_detected = True
@@ -518,12 +493,6 @@ class ProxyWindow:
                 return
             if self._last_used_access_token and self._last_used_access_token == target_access_token:
                 self._clear_proxy_kill_pending_locked()
-                return
-            if not self._proxy_kill_pending:
-                return
-            if self._is_proxy_kill_pending_locked():
-                return
-            self._clear_proxy_kill_pending_locked()
 
     def _clear_proxy_kill_pending(self) -> None:
         with self._auto_load_lock:
@@ -551,26 +520,14 @@ class ProxyWindow:
             if self._proxy_kill_pending:
                 self._proxy_kill_next_allowed_at = 0.0
 
-    def _is_proxy_kill_pending(self) -> bool:
-        with self._auto_load_lock:
-            return self._is_proxy_kill_pending_locked()
-
     def _is_proxy_kill_pending_locked(self) -> bool:
-        if not self._proxy_kill_pending:
-            return False
-        if self._proxy_kill_pending_until <= 0:
-            return True
-        if time.monotonic() <= self._proxy_kill_pending_until:
-            return True
-        self._clear_proxy_kill_pending_locked()
-        return False
+        return self._proxy_kill_pending
 
     def _clear_proxy_kill_pending_locked(self, preserve_cooldown: bool = False) -> None:
         next_allowed_at = self._proxy_kill_next_allowed_at if preserve_cooldown else 0.0
         self._proxy_kill_pending = False
         self._proxy_kill_pending_access_token = ""
         self._proxy_kill_pending_used_access_token = ""
-        self._proxy_kill_pending_until = 0.0
         self._proxy_kill_next_allowed_at = next_allowed_at
         self._proxy_kill_attempt_in_flight = False
 
@@ -643,13 +600,8 @@ class ProxyWindow:
                     if payload.startswith("USED "):
                         parts = payload.split()
                         token = parts[1] if len(parts) >= 2 else ""
-                        original_token = parts[2] if len(parts) >= 3 else ""
-                        selected_token = parts[3] if len(parts) >= 4 else ""
                         if token:
-                            self._post_ui(
-                                lambda value=token, original=original_token, selected=selected_token:
-                                self._on_auto_load_access_token_used(value, original, selected)
-                            )
+                            self._post_ui(lambda value=token: self._on_auto_load_access_token_used(value))
                         continue
                     if payload.startswith("KILL_RESULT "):
                         parts = payload.split()
@@ -669,14 +621,11 @@ class ProxyWindow:
                                 continue
                             self._post_ui(lambda up=up_bytes, down=down_bytes: self._on_proxy_traffic_update(up, down))
                         continue
-                    if payload in {"IDLE", "RESELECT"}:
+                    if payload == "RESELECT":
                         self._post_ui(self._recompute_auto_load_target)
                         continue
                     if payload == "PINGPONG":
                         conn.sendall(("1\n" if self._consume_proxy_kill_pending() else "0\n").encode("utf-8"))
-                        continue
-                    if payload == "KILL_PENDING":
-                        conn.sendall(("1\n" if self._is_proxy_kill_pending() else "0\n").encode("utf-8"))
                         continue
                     if payload == "IDLE_TIMEOUT":
                         continue

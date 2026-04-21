@@ -14,7 +14,6 @@ import sys
 import time
 from threading import Thread
 from pathlib import Path
-from typing import Callable
 
 import psutil
 
@@ -31,9 +30,6 @@ class ProxyService:
     def __init__(self, config: ProxyConfig | None = None) -> None:
         self.config = config or ProxyConfig()
         self.process: subprocess.Popen[str] | None = None
-        self._on_access_token_hit: Callable[[str], None] | None = None
-        self._on_idle_timeout: Callable[[], None] | None = None
-        self._on_traffic_update: Callable[[int, int], None] | None = None
         self.certificate_dir().mkdir(parents=True, exist_ok=True)
 
     def _log(self, message: str) -> None:
@@ -192,15 +188,6 @@ class ProxyService:
             return candidate
         return Path(__file__).with_name("proxy_logger_addon.py")
 
-    def set_access_token_hit_callback(self, callback: Callable[[str], None] | None) -> None:
-        self._on_access_token_hit = callback
-
-    def set_idle_timeout_callback(self, callback: Callable[[], None] | None) -> None:
-        self._on_idle_timeout = callback
-
-    def set_traffic_callback(self, callback: Callable[[int, int], None] | None) -> None:
-        self._on_traffic_update = callback
-
     def _normalize_upstream_proxy(self, upstream: str) -> str:
         value = upstream.strip()
         if value.startswith("http://"):
@@ -301,6 +288,19 @@ class ProxyService:
         for child in alive:
             try:
                 child.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+        try:
+            parent.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+        try:
+            parent.wait(timeout=3)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
+            try:
+                parent.kill()
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
