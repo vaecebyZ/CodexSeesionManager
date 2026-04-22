@@ -24,6 +24,8 @@ from app.services.proxy_service import ProxyConfig, ProxyService
 
 
 _AUTO_LOAD_MISMATCH_WINDOW_SECONDS = 60.0
+_QUOTA_DROP_EPSILON = 0.01
+_QUOTA_DROP_GRACE_SECONDS = 10.0
 
 
 @dataclass
@@ -72,8 +74,11 @@ class ProxyWindow:
         self._proxy_kill_pending = False
         self._proxy_kill_pending_access_token = ""
         self._proxy_kill_pending_used_access_token = ""
+        self._proxy_kill_pending_reason = ""
         self._proxy_kill_next_allowed_at = 0.0
         self._proxy_kill_attempt_in_flight = False
+        self._auto_load_target_selected_at = 0.0
+        self._quota_priority_by_refresh_token: dict[str, float] = {}
         self._auto_load_control_stop = Event()
         self._auto_load_control_socket: socket.socket | None = None
         self._auto_load_control_port = self._start_auto_load_control_server()
@@ -354,8 +359,10 @@ class ProxyWindow:
         quota_items = self.auth_usage_service.pop_pending_quota_items()
         if not quota_items:
             return False
+        quota_snapshot = self.auth_usage_service.quota_snapshot()
+        self._update_quota_drop_state(quota_snapshot)
         self.auth_sync_service.update_usage_cache(
-            self.auth_usage_service.quota_snapshot(),
+            quota_snapshot,
             self.auth_usage_service.plan_type_snapshot(),
             self.auth_usage_service.user_id_snapshot(),
             self.auth_usage_service.email_snapshot(),
@@ -363,6 +370,71 @@ class ProxyWindow:
             self.auth_usage_service.quota_refresh_time_7d_snapshot(),
         )
         return True
+
+    def _update_quota_drop_state(self, quota_snapshot: dict[str, str]) -> None:
+        current_priorities: dict[str, float] = {}
+        dropped_items: list[tuple[str, float, float, str]] = []
+        for refresh_token, quota in quota_snapshot.items():
+            priority = self._quota_priority(quota)
+            if priority < 0:
+                continue
+            current_priorities[refresh_token] = priority
+            previous = self._quota_priority_by_refresh_token.get(refresh_token)
+            if previous is None:
+                continue
+            if priority < previous - _QUOTA_DROP_EPSILON:
+                dropped_items.append((refresh_token, previous, priority, quota))
+
+        if not current_priorities:
+            return
+
+        quota_drop_message = ""
+        target_drop_message = ""
+        with self._auto_load_lock:
+            self._quota_priority_by_refresh_token.update(current_priorities)
+            if not dropped_items or not self._auto_load_enabled:
+                return
+
+            target_refresh_token = self._auto_load_target_refresh_token
+            if not target_refresh_token:
+                return
+
+            now = time.monotonic()
+            if now - self._auto_load_target_selected_at < _QUOTA_DROP_GRACE_SECONDS:
+                return
+
+            for refresh_token, previous, current, quota in dropped_items:
+                if refresh_token == target_refresh_token:
+                    if self._proxy_kill_pending_reason == "quota_drop":
+                        self._clear_proxy_kill_pending_locked()
+                        target_drop_message = (
+                            "[AutoLoad] 当前选举 token 已出现额度下降，取消因额度未命中的断连等待"
+                        )
+                    continue
+
+                state_changed = (
+                    not self._proxy_kill_pending
+                    or self._proxy_kill_pending_reason != "quota_drop"
+                    or self._proxy_kill_pending_used_access_token != refresh_token
+                    or self._proxy_kill_pending_access_token != target_refresh_token
+                )
+                self._proxy_kill_pending = True
+                self._proxy_kill_pending_reason = "quota_drop"
+                self._proxy_kill_pending_access_token = target_refresh_token
+                self._proxy_kill_pending_used_access_token = refresh_token
+                if state_changed:
+                    self._proxy_kill_attempt_in_flight = False
+                    quota_drop_message = (
+                        "[AutoLoad] 额度下降命中非当前选举 token，等待下一次 WebSocket ping/pong 断开旧连接: "
+                        f"actual_refresh_token={refresh_token} target_refresh_token={target_refresh_token} "
+                        f"quota={previous:g}%->{current:g}% raw={quota}"
+                    )
+                break
+
+        if target_drop_message:
+            print(target_drop_message, flush=True)
+        if quota_drop_message:
+            print(quota_drop_message, flush=True)
 
     def _on_auto_load_access_token_used(self, access_token: str) -> None:
         self._update_proxy_kill_pending_for_used_token(access_token)
@@ -418,8 +490,16 @@ class ProxyWindow:
 
     def _set_auto_load_target(self, refresh_token: str, access_token: str) -> None:
         with self._auto_load_lock:
+            target_changed = (
+                refresh_token != self._auto_load_target_refresh_token
+                or access_token != self._auto_load_target_access_token
+            )
             self._auto_load_target_refresh_token = refresh_token
             self._auto_load_target_access_token = access_token
+            if target_changed:
+                self._auto_load_target_selected_at = time.monotonic()
+                if self._proxy_kill_pending_reason == "quota_drop":
+                    self._clear_proxy_kill_pending_locked()
 
     def _restart_proxy_server_async(self) -> None:
         with self._proxy_restart_lock:
@@ -463,8 +543,9 @@ class ProxyWindow:
                 self._clear_proxy_kill_pending_locked()
                 return
             if used_access_token == target_access_token:
-                mismatch_resolved = self._proxy_kill_pending
-                self._clear_proxy_kill_pending_locked()
+                if self._proxy_kill_pending_reason != "quota_drop":
+                    mismatch_resolved = self._proxy_kill_pending
+                    self._clear_proxy_kill_pending_locked()
             else:
                 state_changed = (
                     not self._proxy_kill_pending
@@ -472,6 +553,7 @@ class ProxyWindow:
                     or self._proxy_kill_pending_used_access_token != used_access_token
                 )
                 self._proxy_kill_pending = True
+                self._proxy_kill_pending_reason = "token_mismatch"
                 self._proxy_kill_pending_access_token = target_access_token
                 self._proxy_kill_pending_used_access_token = used_access_token
                 if state_changed:
@@ -491,7 +573,11 @@ class ProxyWindow:
             if not self._auto_load_enabled or not target_access_token:
                 self._clear_proxy_kill_pending_locked()
                 return
-            if self._last_used_access_token and self._last_used_access_token == target_access_token:
+            if (
+                self._proxy_kill_pending_reason != "quota_drop"
+                and self._last_used_access_token
+                and self._last_used_access_token == target_access_token
+            ):
                 self._clear_proxy_kill_pending_locked()
 
     def _clear_proxy_kill_pending(self) -> None:
@@ -499,6 +585,7 @@ class ProxyWindow:
             self._clear_proxy_kill_pending_locked()
 
     def _consume_proxy_kill_pending(self) -> bool:
+        kill_message = ""
         with self._auto_load_lock:
             if not self._is_proxy_kill_pending_locked():
                 return False
@@ -509,7 +596,15 @@ class ProxyWindow:
                 return False
             self._proxy_kill_attempt_in_flight = True
             self._proxy_kill_next_allowed_at = now + _AUTO_LOAD_MISMATCH_WINDOW_SECONDS
-            return True
+            kill_message = (
+                "[AutoLoad] WebSocket ping/pong 触发断开旧连接: "
+                f"reason={self._proxy_kill_pending_reason or '-'} "
+                f"target={self._proxy_kill_pending_access_token or '-'} "
+                f"actual={self._proxy_kill_pending_used_access_token or '-'}"
+            )
+        if kill_message:
+            print(kill_message, flush=True)
+        return True
 
     def _record_proxy_kill_result(self, killed: int) -> None:
         with self._auto_load_lock:
@@ -518,7 +613,7 @@ class ProxyWindow:
                 self._clear_proxy_kill_pending_locked(preserve_cooldown=True)
                 return
             if self._proxy_kill_pending:
-                self._proxy_kill_next_allowed_at = 0.0
+                print("[AutoLoad] 本次未找到可断开的旧连接，保留断连等待并按冷却时间重试", flush=True)
 
     def _is_proxy_kill_pending_locked(self) -> bool:
         return self._proxy_kill_pending
@@ -528,6 +623,7 @@ class ProxyWindow:
         self._proxy_kill_pending = False
         self._proxy_kill_pending_access_token = ""
         self._proxy_kill_pending_used_access_token = ""
+        self._proxy_kill_pending_reason = ""
         self._proxy_kill_next_allowed_at = next_allowed_at
         self._proxy_kill_attempt_in_flight = False
 
