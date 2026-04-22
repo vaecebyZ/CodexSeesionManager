@@ -656,8 +656,11 @@ class ProxyWindow:
             self._upstream_proxy = self.upstream_proxy_var.get().strip()
 
     def _on_use_upstream_proxy_toggled(self) -> None:
-        self._sync_proxy_config_cache()
-        self._persist_config()
+        if not self._refresh_config():
+            return
+        if self.service.process and self.service.process.poll() is None:
+            print("[ProxyWindow] 二级代理配置已变更，正在重启代理使配置立即生效", flush=True)
+            self._restart_proxy_server_async()
 
     def _get_auto_load_target_refresh_token(self) -> str:
         with self._auto_load_lock:
