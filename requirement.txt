@@ -1,4 +1,6 @@
 cx-Freeze>=8,<9
 mitmproxy==11.0.2
+pillow==12.2.0
 psutil==7.2.2
+pystray==0.19.5
 websocket-client==1.9.0

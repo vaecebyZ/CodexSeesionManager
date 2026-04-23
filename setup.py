@@ -8,6 +8,8 @@ project_root = Path(__file__).resolve().parent
 site_packages_dir = Path(sys.prefix) / "Lib" / "site-packages"
 include_files = [
     ("app/services/proxy_logger_addon.py", "proxy_logger_addon.py"),
+    ("icon/icon.ico", "icon/icon.ico"),
+    ("icon/tray_icon.ico", "icon/tray_icon.ico"),
 ]
 mitmproxy_dir = project_root / ".mitmproxy"
 if mitmproxy_dir.exists():
@@ -26,13 +28,13 @@ setup(
     description="Codex Session Manager",
     executables=[
         Executable("mitmdump_entry.py", target_name="mitmdump.exe", base="console"),
-        Executable("main.py", target_name="codex_session.exe", base="gui"),
+        Executable("main.py", target_name="codex_session.exe", base="gui", icon="icon/icon.ico"),
     ],
     options={
         "build_exe": {
             "build_exe": os.environ.get("BUILD_EXE_DIR", str(project_root / "build" / "exe.win-amd64-3.11")),
             "include_files": include_files,
-            "packages": ["mitmproxy", "mitmproxy_rs", "mitmproxy_windows", "psutil", "websocket"],
+            "packages": ["mitmproxy", "mitmproxy_rs", "mitmproxy_windows", "psutil", "websocket", "pystray", "PIL"],
             "excludes": []  # 不需要的库可以排除掉
         }
     }

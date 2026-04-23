@@ -7,6 +7,7 @@ import socket
 import subprocess
 import shutil
 import tempfile
+import sys
 import time
 import tkinter as tk
 from dataclasses import dataclass
@@ -14,6 +15,9 @@ from queue import Empty, Queue
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Callable
+
+import pystray
+from PIL import Image
 
 from app.services.auth_sync_service import AuthFileRow, AuthSyncService
 from app.services.app_config_service import AppConfig, AppConfigService
@@ -26,6 +30,9 @@ from app.services.proxy_service import ProxyConfig, ProxyService
 _AUTO_LOAD_MISMATCH_WINDOW_SECONDS = 60.0
 _QUOTA_DROP_EPSILON = 0.01
 _QUOTA_DROP_GRACE_SECONDS = 10.0
+_TRAY_ICON_TIP = "Codex 账户管理"
+_TRAY_ICON_MAX_ROWS = 4
+_TRAY_ICON_MAX_TIP_LENGTH = 120
 
 
 @dataclass
@@ -92,8 +99,11 @@ class ProxyWindow:
         self._ui_queue: Queue[Callable[[], None]] = Queue()
         self._last_install_rows_signature: tuple[tuple[str, str, str, str], ...] | None = None
         self._last_auth_rows_signature: tuple[tuple[bool, bool, str, str, str, str, str, int], ...] | None = None
+        self._tray_icon_visible = False
+        self._tray_icon: pystray.Icon | None = None
 
         self._build_ui()
+        self.root.bind("<Unmap>", self._on_root_unmap, add="+")
         self.root.after(50, self._drain_ui_queue)
         self.auth_sync_service.set_change_callback(lambda: self._post_ui(self._schedule_refresh_auth_files))
         self.auth_usage_service.set_change_callback(lambda: self._post_ui(self._schedule_refresh_auth_files))
@@ -666,6 +676,14 @@ class ProxyWindow:
         with self._auto_load_lock:
             return self._auto_load_target_refresh_token if self._auto_load_enabled else ""
 
+    def _get_auto_load_marks(self) -> tuple[str, str]:
+        current_refresh_token = ""
+        for row in self.auth_sync_service.list_auth_rows():
+            if row.current:
+                current_refresh_token = row.refresh_token
+                break
+        return current_refresh_token, self._get_auto_load_target_refresh_token()
+
     def _get_auto_load_target_access_token(self) -> str:
         with self._auto_load_lock:
             return self._auto_load_target_access_token if self._auto_load_enabled else ""
@@ -885,6 +903,7 @@ class ProxyWindow:
         if update_status and signature != self._last_auth_rows_signature:
             print(f"已刷新 {len(rows)} 个文件")
         self._last_auth_rows_signature = signature
+        self._refresh_tray_icon_tooltip(rows)
         return len(rows)
 
     def _scan_codex_installs(self) -> list[CodexInstallRow]:
@@ -1226,7 +1245,91 @@ class ProxyWindow:
             return f"{size_bytes / (1024 * 1024):.1f}M"
         return f"{size_bytes / (1024 * 1024 * 1024):.1f}G"
 
+    def _on_root_unmap(self, _event: tk.Event) -> None:
+        if not self._tray_icon_visible and self.root.state() == "iconic":
+            self.root.after(0, self._hide_to_tray)
+
+    def _hide_to_tray(self) -> None:
+        self._add_tray_icon()
+        self.root.withdraw()
+
+    def _restore_from_tray(self) -> None:
+        self._remove_tray_icon()
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def _add_tray_icon(self) -> None:
+        if self._tray_icon_visible:
+            return
+        menu = pystray.Menu(pystray.MenuItem("显示", self._on_tray_show, default=True))
+        self._tray_icon = pystray.Icon(_TRAY_ICON_TIP, self._load_tray_icon(), self._build_tray_icon_tip(), menu)
+        self._tray_icon.run_detached()
+        self._tray_icon_visible = True
+
+    def _remove_tray_icon(self) -> None:
+        if not self._tray_icon_visible:
+            return
+        if self._tray_icon is not None:
+            self._tray_icon.stop()
+            self._tray_icon = None
+        self._tray_icon_visible = False
+
+    def _on_tray_show(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+        self._post_ui(self._restore_from_tray)
+
+    def _refresh_tray_icon_tooltip(self, rows: list[AuthFileRow] | None = None) -> None:
+        if not self._tray_icon_visible or self._tray_icon is None:
+            return
+        self._tray_icon.title = self._build_tray_icon_tip(rows)
+
+    def _build_tray_icon_tip(self, rows: list[AuthFileRow] | None = None) -> str:
+        auth_rows = rows if rows is not None else self.auth_sync_service.list_auth_rows()
+        if not auth_rows:
+            return _TRAY_ICON_TIP
+        current_refresh_token, load_refresh_token = self._get_auto_load_marks()
+        lines = [_TRAY_ICON_TIP]
+        for row in auth_rows[:_TRAY_ICON_MAX_ROWS]:
+            marks = []
+            if row.refresh_token == current_refresh_token:
+                marks.append("当前")
+            if row.refresh_token == load_refresh_token:
+                marks.append("负载")
+            mark_text = f"[{'/'.join(marks)}] " if marks else ""
+            account_id = self._shorten_middle(row.account_id, 6, 4) if row.account_id else "-"
+            quota = row.quota or "-"
+            lines.append(f"{mark_text}{account_id} {quota}")
+        if len(auth_rows) > _TRAY_ICON_MAX_ROWS:
+            lines.append("...")
+        tip = "\n".join(lines)
+        if len(tip) <= _TRAY_ICON_MAX_TIP_LENGTH:
+            return tip
+        truncated_lines = [lines[0]]
+        for line in lines[1:]:
+            candidate = "\n".join(truncated_lines + [line])
+            if len(candidate) > _TRAY_ICON_MAX_TIP_LENGTH - 4:
+                truncated_lines.append("...")
+                break
+            truncated_lines.append(line)
+        return "\n".join(truncated_lines)
+
+    def _load_tray_icon(self) -> Image.Image:
+        icon_path = self._get_icon_path()
+        if icon_path.exists():
+            return Image.open(icon_path)
+        return Image.new("RGBA", (64, 64), "#2d8cff")
+
+    def _get_icon_path(self) -> Path:
+        if getattr(sys, "frozen", False):
+            base_dir = Path(sys.executable).resolve().parent
+        else:
+            base_dir = Path(__file__).resolve().parents[2]
+        return base_dir / "icon" / "tray_icon.ico"
+
     def _on_close(self) -> None:
+        if not messagebox.askyesno("退出确认", "确认退出程序吗？"):
+            return
+        self._remove_tray_icon()
         self._persist_config()
         self.auth_usage_service.stop()
         self.auth_sync_service.stop()

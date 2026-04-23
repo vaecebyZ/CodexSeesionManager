@@ -2,12 +2,21 @@ import ctypes
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 _MB_YESNO = 0x00000004
 _MB_OK = 0x00000000
 _MB_ICONWARNING = 0x00000030
 _MB_DEFBUTTON2 = 0x00000100
 _IDYES = 6
+
+
+def _get_resource_path(*parts: str) -> str:
+    if getattr(sys, "frozen", False):
+        base_dir = Path(sys.executable).resolve().parent
+    else:
+        base_dir = Path(__file__).resolve().parent
+    return str(base_dir.joinpath(*parts))
 
 
 def _is_admin() -> bool:
@@ -66,6 +75,12 @@ def main() -> None:
     import tkinter as tk
 
     root = tk.Tk()
+    icon_path = _get_resource_path("icon", "icon.ico")
+    if os.path.exists(icon_path):
+        try:
+            root.iconbitmap(icon_path)
+        except tk.TclError:
+            pass
     ProxyWindow(root)
     root.mainloop()
 
