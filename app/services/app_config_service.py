@@ -4,6 +4,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from app.utils.path_utils import app_root
+
 
 @dataclass
 class AppConfig:
@@ -15,7 +17,7 @@ class AppConfig:
 
 class AppConfigService:
     def __init__(self, config_path: Path | None = None) -> None:
-        self.config_path = config_path or Path(__file__).resolve().parents[2] / "config.json"
+        self.config_path = config_path or app_root() / "config.json"
 
     def exists(self) -> bool:
         return self.config_path.exists()

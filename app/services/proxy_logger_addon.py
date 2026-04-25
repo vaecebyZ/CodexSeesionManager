@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import socket
+import sys
 import time
 from threading import Event, Lock, Thread
 
@@ -11,6 +13,17 @@ from mitmproxy import http
 
 _RESELECT_EVENT = "RESELECT"
 _IDLE_TIMEOUT_EVENT = "IDLE_TIMEOUT"
+_MIB_TCP_STATE_DELETE_TCB = 12
+
+
+class _MibTcpRow(ctypes.Structure):
+    _fields_ = [
+        ("dwState", ctypes.c_ulong),
+        ("dwLocalAddr", ctypes.c_ulong),
+        ("dwLocalPort", ctypes.c_ulong),
+        ("dwRemoteAddr", ctypes.c_ulong),
+        ("dwRemotePort", ctypes.c_ulong),
+    ]
 
 
 class _PingPongLogHandler(logging.Handler):
@@ -62,6 +75,8 @@ class ProxyLoggerAddon:
         self._idle_watcher.start()
         self._watcher = Thread(target=self._watch_idle_timeout, daemon=True)
         self._watcher.start()
+        self._manual_kill_watcher = Thread(target=self._watch_manual_kill, daemon=True)
+        self._manual_kill_watcher.start()
 
     def running(self) -> None:
         _log("代理运行中")
@@ -88,23 +103,62 @@ class ProxyLoggerAddon:
             }
 
     def _kill_active_flows(self) -> int:
+        killed, _tracked, _reset = self._kill_active_flows_with_stats()
+        return killed
+
+    def _kill_active_flows_with_stats(self) -> tuple[int, int, int]:
+        self._cleanup_flows()
         with self._flow_lock:
             flows = list(self._live_flows.values())
         killed = 0
-        killable = 0
+        reset = 0
         for flow in flows:
-            if not getattr(flow, "killable", False):
-                continue
-            killable += 1
-            try:
-                flow.kill()
+            if self._reset_flow_tcp_connection(flow):
+                reset += 1
                 killed += 1
-            except Exception as exc:
-                _log(f"断开代理连接失败: id={getattr(flow, 'id', '')} error={exc}")
-                continue
         self._cleanup_flows()
-        _log(f"断开代理连接检查: tracked={len(flows)} killable={killable} killed={killed}")
-        return killed
+        _log(f"断开代理连接检查: tracked={len(flows)} reset={reset} killed={killed}")
+        return killed, len(flows), reset
+
+    def _reset_flow_tcp_connection(self, flow) -> bool:
+        client_conn = getattr(flow, "client_conn", None)
+        if client_conn is None:
+            return False
+        local_addr = getattr(client_conn, "sockname", None)
+        remote_addr = getattr(client_conn, "peername", None)
+        if not self._reset_tcp_connection(local_addr, remote_addr):
+            return False
+        try:
+            flow.live = False
+        except Exception:
+            pass
+        _log(
+            "已重置 TCP 连接: "
+            f"local={local_addr[0]}:{local_addr[1]} remote={remote_addr[0]}:{remote_addr[1]} "
+            f"id={getattr(flow, 'id', '')}"
+        )
+        return True
+
+    def _reset_tcp_connection(self, local_addr, remote_addr) -> bool:
+        if sys.platform != "win32" or not local_addr or not remote_addr:
+            return False
+        local_host, local_port = local_addr[:2]
+        remote_host, remote_port = remote_addr[:2]
+        try:
+            row = _MibTcpRow()
+            row.dwState = _MIB_TCP_STATE_DELETE_TCB
+            row.dwLocalAddr = int.from_bytes(socket.inet_aton(local_host), "little")
+            row.dwLocalPort = socket.htons(int(local_port))
+            row.dwRemoteAddr = int.from_bytes(socket.inet_aton(remote_host), "little")
+            row.dwRemotePort = socket.htons(int(remote_port))
+            result = ctypes.windll.iphlpapi.SetTcpEntry(ctypes.byref(row))
+        except Exception as exc:
+            _log(f"重置 TCP 连接异常: local={local_addr} remote={remote_addr} error={exc}")
+            return False
+        if result != 0:
+            _log(f"重置 TCP 连接失败: local={local_addr} remote={remote_addr} code={result}")
+            return False
+        return True
 
     def _watch_idle_reselect(self) -> None:
         while not self._stop_event.wait(0.5):
@@ -132,6 +186,14 @@ class ProxyLoggerAddon:
             if killed > 0:
                 _log(f"kill active flows: {killed}")
             _log("超过 60 秒没有数据流出")
+
+    def _watch_manual_kill(self) -> None:
+        while not self._stop_event.wait(0.5):
+            if not self._should_manual_disconnect():
+                continue
+            killed, tracked, reset = self._kill_active_flows_with_stats()
+            self._report_control_event(f"MANUAL_KILL_RESULT {killed} {tracked} {reset}")
+            _log(f"手动矫正流量，tracked={tracked} reset={reset} killed={killed}")
 
     def _get_selected_access_token(self) -> str:
         port_text = os.environ.get("AUTOLOAD_CONTROL_PORT", "").strip()
@@ -229,6 +291,9 @@ class ProxyLoggerAddon:
     def _should_disconnect_on_pingpong(self) -> bool:
         return self._send_control_message("PINGPONG", read_response=True) == "1"
 
+    def _should_manual_disconnect(self) -> bool:
+        return self._send_control_message("MANUAL_KILL", read_response=True) == "1"
+
     def client_connected(self, *args, **kwargs) -> None:
         self._mark_activity()
         return None
@@ -287,6 +352,11 @@ class ProxyLoggerAddon:
         self._report_traffic()
 
     def websocket_message(self, flow: http.HTTPFlow) -> None:
+        self._mark_activity()
+        self._track_flow(flow)
+        return None
+
+    def websocket_start(self, flow: http.HTTPFlow) -> None:
         self._mark_activity()
         self._track_flow(flow)
         return None

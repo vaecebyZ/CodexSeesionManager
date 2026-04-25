@@ -9,6 +9,8 @@ import traceback
 from threading import Event, Lock, Thread
 from typing import Callable
 
+from app.utils.path_utils import app_root
+
 
 @dataclass
 class AuthFileRow:
@@ -36,7 +38,7 @@ class AuthSyncService:
     ) -> None:
         user_profile = os.environ.get("USERPROFILE") or str(Path.home())
         self.source_path = source_path or Path(user_profile) / ".codex" / "auth.json"
-        self.target_dir = target_dir or Path(__file__).resolve().parents[2] / "auth"
+        self.target_dir = target_dir or app_root() / "auth"
         self.interval_seconds = interval_seconds
         self._stop_event = Event()
         self._state_lock = Lock()

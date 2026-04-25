@@ -17,6 +17,7 @@ from threading import Event, Lock, Thread
 from typing import Callable
 
 import pystray
+import psutil
 from PIL import Image
 
 from app.services.auth_sync_service import AuthFileRow, AuthSyncService
@@ -44,6 +45,13 @@ class CodexInstallRow:
     version: str
 
 
+@dataclass
+class CodexProcessRow:
+    pid: int
+    name: str
+    children: list["CodexProcessRow"]
+
+
 class ProxyWindow:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -64,6 +72,7 @@ class ProxyWindow:
         self.upstream_proxy_var = tk.StringVar(value=self.service.config.upstream_proxy)
         self.use_upstream_proxy_var = tk.BooleanVar(value=self.service.config.use_upstream_proxy)
         self._rows_by_item: dict[str, CodexInstallRow] = {}
+        self._launch_buttons: dict[str, ttk.Button] = {}
         self._auth_rows_by_item: dict[str, AuthFileRow] = {}
         self._tooltip: tk.Toplevel | None = None
         self._tooltip_label: ttk.Label | None = None
@@ -84,6 +93,9 @@ class ProxyWindow:
         self._proxy_kill_pending_reason = ""
         self._proxy_kill_next_allowed_at = 0.0
         self._proxy_kill_attempt_in_flight = False
+        self._manual_proxy_kill_pending = False
+        self._correct_traffic_button: ttk.Button | None = None
+        self._correct_traffic_after_id: str | None = None
         self._auto_load_target_selected_at = 0.0
         self._quota_priority_by_refresh_token: dict[str, float] = {}
         self._auto_load_control_stop = Event()
@@ -164,12 +176,22 @@ class ProxyWindow:
         install_actions = ttk.Frame(table_frame)
         install_actions.pack(fill="x")
         ttk.Button(install_actions, text="刷新", command=self.refresh_all).pack(side="right")
+        ttk.Button(install_actions, text="结束进程", command=self.kill_codex_processes).pack(side="right", padx=(0, 8))
 
         tree_wrap = ttk.Frame(table_frame)
         tree_wrap.pack(fill="x", pady=(6, 0))
 
         columns = ("name", "path", "size", "version", "action")
-        self.tree = ttk.Treeview(tree_wrap, columns=columns, show="headings", selectmode="browse", height=4)
+        style = ttk.Style()
+        style.configure("Install.Treeview", rowheight=32)
+        self.tree = ttk.Treeview(
+            tree_wrap,
+            columns=columns,
+            show="headings",
+            selectmode="none",
+            height=4,
+            style="Install.Treeview",
+        )
         self.tree.heading("name", text="名称")
         self.tree.heading("path", text="路径")
         self.tree.heading("size", text="大小")
@@ -179,13 +201,23 @@ class ProxyWindow:
         self.tree.column("path", width=420, anchor="w", stretch=True)
         self.tree.column("size", width=90, anchor="center", stretch=False)
         self.tree.column("version", width=100, anchor="center", stretch=False)
-        self.tree.column("action", width=70, anchor="center", stretch=False)
+        self.tree.column("action", width=82, anchor="center", stretch=False)
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<Motion>", self._on_tree_motion)
         self.tree.bind("<Leave>", lambda _event: self._hide_tooltip())
+        self.tree.bind("<Configure>", lambda _event: self._refresh_launch_buttons())
 
-        y_scroll = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=y_scroll.set)
+        y_scroll = ttk.Scrollbar(
+            tree_wrap,
+            orient="vertical",
+            command=lambda *args: (self.tree.yview(*args), self.root.after_idle(self._refresh_launch_buttons)),
+        )
+        self.tree.configure(
+            yscrollcommand=lambda first, last: (
+                y_scroll.set(first, last),
+                self.root.after_idle(self._refresh_launch_buttons),
+            )
+        )
         self.tree.grid(row=0, column=0, sticky="nsew")
         y_scroll.grid(row=0, column=1, sticky="ns")
         tree_wrap.rowconfigure(0, weight=1)
@@ -196,7 +228,15 @@ class ProxyWindow:
 
         auth_options = ttk.Frame(auth_frame)
         auth_options.pack(fill="x", pady=(0, 6))
-        ttk.Checkbutton(auth_options, text="自动负载", variable=self.auto_load_var, command=self._on_auto_load_toggled).pack(side="right")
+        ttk.Checkbutton(auth_options, text="自动负载", variable=self.auto_load_var, command=self._on_auto_load_toggled).pack(side="left")
+        self._correct_traffic_button = ttk.Button(auth_options, text="矫正流量", command=self.correct_traffic)
+        self._correct_traffic_button.pack(side="right")
+        update_auth_button = ttk.Button(auth_options, text="更新授权", command=self.update_auth)
+        update_auth_button.pack(side="right", padx=(0, 8))
+        self._bind_widget_tooltip(
+            update_auth_button,
+            "更新授权文件",
+        )
 
         auth_wrap = ttk.Frame(auth_frame)
         auth_wrap.pack(fill="both", expand=True)
@@ -230,6 +270,8 @@ class ProxyWindow:
         self.auth_tree.column("traffic", width=104, anchor="center", stretch=False)
         self.auth_tree.bind("<Double-1>", self._on_auth_tree_double_click)
         self.auth_tree.bind("<Button-3>", self._on_auth_tree_right_click)
+        self.auth_tree.bind("<Delete>", self._on_auth_tree_delete_key)
+        self.auth_tree.bind("<KP_Delete>", self._on_auth_tree_delete_key)
         self.auth_tree.bind("<Motion>", self._on_auth_tree_motion)
         self.auth_tree.bind("<Leave>", lambda _event: self._hide_tooltip())
         self._auth_menu = tk.Menu(self.root, tearoff=0)
@@ -254,6 +296,27 @@ class ProxyWindow:
         x = (screen_width - width) // 2
         y = (screen_height - height) // 2
         self.root.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _center_child_window(self, window: tk.Toplevel, width: int, height: int) -> None:
+        self.root.update_idletasks()
+        window.update_idletasks()
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_width = self.root.winfo_width()
+        root_height = self.root.winfo_height()
+        x = root_x + max((root_width - width) // 2, 0)
+        y = root_y + max((root_height - height) // 2, 0)
+        window.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _bind_dialog_close_keys(self, dialog: tk.Toplevel) -> None:
+        def close_dialog(_event: tk.Event | None = None) -> str:
+            if dialog.winfo_exists():
+                dialog.destroy()
+            return "break"
+
+        dialog.bind("<Escape>", close_dialog)
+        dialog.bind_all("<Escape>", close_dialog)
+        dialog.bind("<Destroy>", lambda _event: dialog.unbind_all("<Escape>"), add="+")
 
     def _post_ui(self, callback: Callable[[], None]) -> None:
         self._ui_queue.put(callback)
@@ -511,14 +574,15 @@ class ProxyWindow:
                 if self._proxy_kill_pending_reason == "quota_drop":
                     self._clear_proxy_kill_pending_locked()
 
-    def _restart_proxy_server_async(self) -> None:
+    def _restart_proxy_server_async(self) -> bool:
         with self._proxy_restart_lock:
             if self._proxy_restart_pending:
-                return
+                return False
             if not (self.service.process and self.service.process.poll() is None):
-                return
+                return False
             self._proxy_restart_pending = True
         Thread(target=self._restart_proxy_server_worker, daemon=True).start()
+        return True
 
     def _restart_proxy_server_worker(self) -> None:
         try:
@@ -625,6 +689,21 @@ class ProxyWindow:
             if self._proxy_kill_pending:
                 print("[AutoLoad] 本次未找到可断开的旧连接，保留断连等待并按冷却时间重试", flush=True)
 
+    def _request_manual_proxy_kill(self) -> None:
+        with self._auto_load_lock:
+            self._manual_proxy_kill_pending = True
+        print("[ProxyWindow] 已请求断开代理长连接", flush=True)
+
+    def _consume_manual_proxy_kill_pending(self) -> bool:
+        with self._auto_load_lock:
+            if not self._manual_proxy_kill_pending:
+                return False
+            self._manual_proxy_kill_pending = False
+        return True
+
+    def _record_manual_proxy_kill_result(self, killed: int, tracked: int, reset: int) -> None:
+        print(f"[ProxyWindow] 已断开代理连接: tracked={tracked} reset={reset} killed={killed}", flush=True)
+
     def _is_proxy_kill_pending_locked(self) -> bool:
         return self._proxy_kill_pending
 
@@ -728,6 +807,24 @@ class ProxyWindow:
                             killed = 0
                         self._post_ui(lambda value=killed: self._record_proxy_kill_result(value))
                         continue
+                    if payload.startswith("MANUAL_KILL_RESULT "):
+                        parts = payload.split()
+                        try:
+                            killed = int(parts[1]) if len(parts) >= 2 else 0
+                            tracked = int(parts[2]) if len(parts) >= 3 else killed
+                            reset = int(parts[3]) if len(parts) >= 4 else killed
+                        except ValueError:
+                            killed = 0
+                            tracked = 0
+                            reset = 0
+                        self._post_ui(
+                            lambda value=killed, total=tracked, reset_count=reset: self._record_manual_proxy_kill_result(
+                                value,
+                                total,
+                                reset_count,
+                            )
+                        )
+                        continue
                     if payload.startswith("TRAFFIC "):
                         parts = payload.split()
                         if len(parts) == 3:
@@ -743,6 +840,9 @@ class ProxyWindow:
                         continue
                     if payload == "PINGPONG":
                         conn.sendall(("1\n" if self._consume_proxy_kill_pending() else "0\n").encode("utf-8"))
+                        continue
+                    if payload == "MANUAL_KILL":
+                        conn.sendall(("1\n" if self._consume_manual_proxy_kill_pending() else "0\n").encode("utf-8"))
                         continue
                     if payload == "IDLE_TIMEOUT":
                         continue
@@ -851,14 +951,207 @@ class ProxyWindow:
         auth_count = self.refresh_auth_files(update_status=False)
         print(f"已刷新 {install_count} 项 / {auth_count} 个文件")
 
+    def update_auth(self) -> None:
+        if not messagebox.askyesno("更新授权", "是否创建新的授权文件？\n注意：本次操作会结束Codex进程"):
+            return
+        auth_path = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".codex" / "auth.json"
+        try:
+            if auth_path.exists():
+                auth_path.unlink()
+                print(f"[ProxyWindow] 已删除授权文件: {auth_path}", flush=True)
+            else:
+                print(f"[ProxyWindow] 授权文件不存在: {auth_path}", flush=True)
+        except OSError as exc:
+            messagebox.showerror("更新授权失败", f"删除授权文件失败: {exc}")
+            return
+
+        for image_name in ("Codex.exe", "code.exe"):
+            self._kill_process_by_image_name(image_name)
+
+        launch_row = self._get_default_codex_launch_row()
+        if launch_row is None:
+            messagebox.showerror("更新授权失败", "未找到可启动的 Codex 安装项。")
+            return
+        self._launch_codex(launch_row)
+
+    def correct_traffic(self) -> None:
+        self._request_manual_proxy_kill()
+        self._start_correct_traffic_countdown()
+
+    def _start_correct_traffic_countdown(self) -> None:
+        if self._correct_traffic_after_id is not None:
+            try:
+                self.root.after_cancel(self._correct_traffic_after_id)
+            except tk.TclError:
+                pass
+            self._correct_traffic_after_id = None
+        self._update_correct_traffic_countdown(5)
+
+    def _update_correct_traffic_countdown(self, seconds: int) -> None:
+        if self._correct_traffic_button is None:
+            return
+        if seconds <= 0:
+            self._correct_traffic_button.config(text="矫正流量", state="normal")
+            self._correct_traffic_after_id = None
+            return
+        self._correct_traffic_button.config(text=f"重置中 {seconds}", state="disabled")
+        self._correct_traffic_after_id = self.root.after(
+            1000,
+            lambda: self._update_correct_traffic_countdown(seconds - 1),
+        )
+
+    def _kill_process_by_image_name(self, image_name: str) -> None:
+        result = subprocess.run(
+            ["taskkill", "/im", image_name, "/f"],
+            capture_output=True,
+            text=True,
+            encoding="gbk",
+            errors="replace",
+        )
+        output = (result.stdout or result.stderr).strip()
+        if result.returncode == 0:
+            print(f"[ProxyWindow] 已结束进程: {image_name}", flush=True)
+        else:
+            print(f"[ProxyWindow] 结束进程跳过: {image_name} {output}", flush=True)
+
+    def _get_default_codex_launch_row(self) -> CodexInstallRow | None:
+        rows = list(self._rows_by_item.values()) or self._scan_codex_installs()
+        if not rows:
+            return None
+        for row in rows:
+            if row.path.replace("/", "\\").endswith("\\app\\Codex.exe"):
+                return row
+        return rows[0]
+
+    def kill_codex_processes(self) -> None:
+        process_rows = self._list_codex_process_rows()
+        dialog = tk.Toplevel(self.root)
+        dialog.title("结束进程")
+        dialog.transient(self.root)
+        dialog.resizable(True, True)
+        dialog.grab_set()
+        self._bind_dialog_close_keys(dialog)
+        self._center_child_window(dialog, 460, 360)
+
+        body = ttk.Frame(dialog, padding=12)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(body, text="选择要强制结束的进程").pack(anchor="w")
+        tree_frame = ttk.Frame(body)
+        tree_frame.pack(fill="both", expand=True, pady=(8, 10))
+
+        process_tree = ttk.Treeview(tree_frame, columns=("pid",), selectmode="extended")
+        process_tree.heading("#0", text="进程名称")
+        process_tree.heading("pid", text="PID")
+        process_tree.column("#0", width=280, anchor="w")
+        process_tree.column("pid", width=120, anchor="center", stretch=False)
+        y_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=process_tree.yview)
+        process_tree.configure(yscrollcommand=y_scroll.set)
+        process_tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll.grid(row=0, column=1, sticky="ns")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+
+        item_depths: dict[str, int] = {}
+
+        def insert_process(parent: str, row: CodexProcessRow, depth: int) -> None:
+            item_id = str(row.pid)
+            process_tree.insert(parent, "end", iid=item_id, text=row.name, values=(row.pid,), open=True)
+            item_depths[item_id] = depth
+            for child in row.children:
+                insert_process(item_id, child, depth + 1)
+
+        for process_row in process_rows:
+            insert_process("", process_row, 0)
+        all_items = tuple(item_depths)
+        root_items = process_tree.get_children("")
+        if all_items:
+            process_tree.selection_set(root_items)
+        else:
+            process_tree.insert("", "end", text="未找到 Codex.exe 或 codex.exe 进程", values=("",))
+
+        button_row = ttk.Frame(body)
+        button_row.pack(fill="x")
+        button_row.columnconfigure(0, weight=1)
+        button_row.columnconfigure(1, weight=0)
+        button_row.columnconfigure(2, weight=1)
+
+        def kill_selected() -> None:
+            selected_items = [item for item in process_tree.selection() if item in item_depths]
+            if not selected_items:
+                messagebox.showwarning("结束进程", "请先选择要结束的进程。", parent=dialog)
+                return
+            messages = self._kill_process_ids([int(item) for item in selected_items], item_depths)
+            if messages:
+                messagebox.showerror("结束进程失败", "\n".join(messages), parent=dialog)
+            dialog.destroy()
+
+        end_button = ttk.Button(button_row, text="结束选中进程", command=kill_selected)
+        end_button.grid(row=0, column=1)
+        if not all_items:
+            end_button.config(state="disabled")
+
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.wait_window()
+
+    def _list_codex_process_rows(self) -> list[CodexProcessRow]:
+        target_names = {"Codex.exe", "codex.exe"}
+        root_processes: list[psutil.Process] = []
+        for process in psutil.process_iter(["name"]):
+            try:
+                if process.info.get("name") in target_names:
+                    root_processes.append(process)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        child_pids = {
+            child.pid
+            for process in root_processes
+            for child in self._safe_children(process)
+        }
+        roots = [process for process in root_processes if process.pid not in child_pids]
+        return [self._build_process_row(process) for process in sorted(roots, key=lambda item: item.pid)]
+
+    def _build_process_row(self, process: psutil.Process) -> CodexProcessRow:
+        try:
+            process_name = process.name()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            process_name = "<无法读取>"
+        children = [self._build_process_row(child) for child in self._safe_children(process)]
+        children.sort(key=lambda row: row.pid)
+        return CodexProcessRow(pid=process.pid, name=process_name, children=children)
+
+    def _safe_children(self, process: psutil.Process) -> list[psutil.Process]:
+        try:
+            return process.children()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return []
+
+    def _kill_process_ids(self, process_ids: list[int], item_depths: dict[str, int]) -> list[str]:
+        failed_messages: list[str] = []
+        ordered_process_ids = sorted(process_ids, key=lambda pid: item_depths.get(str(pid), 0), reverse=True)
+        for process_id in ordered_process_ids:
+            result = subprocess.run(
+                ["taskkill", "/pid", str(process_id), "/f"],
+                capture_output=True,
+                text=True,
+                encoding="gbk",
+                errors="replace",
+            )
+            output = (result.stdout or result.stderr).strip()
+            if result.returncode != 0:
+                failed_messages.append(f"PID {process_id}: {output or '结束失败'}")
+        return failed_messages
+
     def refresh_installs(self, update_status: bool = True) -> int:
+        self._destroy_launch_buttons()
         for item in self.tree.get_children():
             self.tree.delete(item)
         self._rows_by_item.clear()
         rows = self._scan_codex_installs()
         for row in rows:
-            item = self.tree.insert("", "end", values=(row.name, row.display_path, row.size, row.version, "启动"))
+            item = self.tree.insert("", "end", values=(row.name, row.display_path, row.size, row.version, ""))
             self._rows_by_item[item] = row
+        self.root.after_idle(self._refresh_launch_buttons)
         signature = tuple((row.name, row.display_path, row.size, row.version) for row in rows)
         if update_status and signature != self._last_install_rows_signature:
             print(f"已刷新 {len(rows)} 项")
@@ -866,6 +1159,9 @@ class ProxyWindow:
         return len(rows)
 
     def refresh_auth_files(self, update_status: bool = True) -> int:
+        selected_row = self._get_selected_auth_row()
+        selected_refresh_token = selected_row.refresh_token if selected_row is not None else ""
+        selected_item = ""
         for item in self.auth_tree.get_children():
             self.auth_tree.delete(item)
         self._auth_rows_by_item.clear()
@@ -887,6 +1183,11 @@ class ProxyWindow:
                 ),
             )
             self._auth_rows_by_item[item] = row
+            if row.refresh_token == selected_refresh_token:
+                selected_item = item
+        if selected_item:
+            self.auth_tree.selection_set(selected_item)
+            self.auth_tree.focus(selected_item)
         signature = tuple(
             (
                 row.current,
@@ -910,7 +1211,11 @@ class ProxyWindow:
         rows: list[CodexInstallRow] = []
         rows.extend(self._scan_windowsapps_codex())
         rows.extend(self._scan_node_codex())
-        return rows
+        return [row for row in rows if self._is_supported_codex_executable(row.path)]
+
+    def _is_supported_codex_executable(self, path: str) -> bool:
+        normalized_path = path.replace("/", "\\")
+        return normalized_path.endswith("\\app\\Codex.exe") or normalized_path.endswith("\\codex\\codex.exe")
 
     def _scan_windowsapps_codex(self) -> list[CodexInstallRow]:
         base_dir = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "WindowsApps"
@@ -1104,6 +1409,10 @@ class ProxyWindow:
         finally:
             self._auth_menu.grab_release()
 
+    def _on_auth_tree_delete_key(self, _event: tk.Event) -> str:
+        self._delete_selected_auth_row()
+        return "break"
+
     def _activate_selected_auth_row(self) -> None:
         row = self._get_selected_auth_row()
         if row is not None:
@@ -1166,7 +1475,50 @@ class ProxyWindow:
         if self._tooltip is not None:
             self._tooltip.withdraw()
 
+    def _bind_widget_tooltip(self, widget: tk.Widget, text: str) -> None:
+        widget.bind("<Enter>", lambda event: self._show_tooltip(event.x_root, event.y_root, text))
+        widget.bind("<Motion>", lambda event: self._show_tooltip(event.x_root, event.y_root, text))
+        widget.bind("<Leave>", lambda _event: self._hide_tooltip())
+
+    def _destroy_launch_buttons(self) -> None:
+        for button in self._launch_buttons.values():
+            button.destroy()
+        self._launch_buttons.clear()
+
+    def _refresh_launch_buttons(self) -> None:
+        if not hasattr(self, "tree"):
+            return
+        for item in self.tree.get_children():
+            row = self._rows_by_item.get(item)
+            if row is None:
+                continue
+            button = self._launch_buttons.get(item)
+            if button is None:
+                button = ttk.Button(
+                    self.tree,
+                    text="启动",
+                    command=lambda launch_row=row: self._launch_codex(launch_row),
+                )
+                self._launch_buttons[item] = button
+            bbox = self.tree.bbox(item, "action")
+            if not bbox:
+                button.place_forget()
+                continue
+            x, y, width, height = bbox
+            button_width = 56
+            button_height = 24
+            button.place(
+                x=x + max((width - button_width) // 2, 0),
+                y=y + max((height - button_height) // 2, 0),
+                width=button_width,
+                height=button_height,
+            )
+        stale_items = set(self._launch_buttons) - set(self.tree.get_children())
+        for item in stale_items:
+            self._launch_buttons.pop(item).destroy()
+
     def _on_tree_click(self, event: tk.Event) -> None:
+        self.tree.selection_remove(self.tree.selection())
         region = self.tree.identify_region(event.x, event.y)
         if region != "cell":
             return
