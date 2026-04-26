@@ -109,6 +109,7 @@ class ProxyWindow:
         self._traffic_refresh_pending = False
         self._quota_refresh_pending = False
         self._ui_queue: Queue[Callable[[], None]] = Queue()
+        self._closing = False
         self._last_install_rows_signature: tuple[tuple[str, str, str, str], ...] | None = None
         self._last_auth_rows_signature: tuple[tuple[bool, bool, str, str, str, str, str, int], ...] | None = None
         self._tray_icon_visible = False
@@ -319,9 +320,13 @@ class ProxyWindow:
         dialog.bind("<Destroy>", lambda _event: dialog.unbind_all("<Escape>"), add="+")
 
     def _post_ui(self, callback: Callable[[], None]) -> None:
+        if self._closing:
+            return
         self._ui_queue.put(callback)
 
     def _drain_ui_queue(self) -> None:
+        if self._closing:
+            return
         try:
             while True:
                 callback = self._ui_queue.get_nowait()
@@ -332,7 +337,8 @@ class ProxyWindow:
         except Empty:
             pass
         try:
-            self.root.after(50, self._drain_ui_queue)
+            if not self._closing:
+                self.root.after(50, self._drain_ui_queue)
         except tk.TclError:
             pass
 
@@ -1681,6 +1687,7 @@ class ProxyWindow:
     def _on_close(self) -> None:
         if not messagebox.askyesno("退出确认", "确认退出程序吗？"):
             return
+        self._closing = True
         self._remove_tray_icon()
         self._persist_config()
         self.auth_usage_service.stop()

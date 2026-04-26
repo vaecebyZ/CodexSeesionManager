@@ -2,6 +2,8 @@ import ctypes
 import os
 import subprocess
 import sys
+import threading
+import traceback
 from pathlib import Path
 
 _MB_YESNO = 0x00000004
@@ -53,6 +55,30 @@ def _restart_as_admin() -> bool:
         return False
 
 
+def _install_exception_hooks(root) -> None:
+    def log_exception(prefix: str, exc_type, exc_value, exc_traceback) -> None:
+        if exc_type is KeyboardInterrupt:
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        detail = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        print(f"[Crash] {prefix}\n{detail}", flush=True)
+
+    def handle_thread_exception(args: threading.ExceptHookArgs) -> None:
+        log_exception(f"线程异常: {args.thread.name}", args.exc_type, args.exc_value, args.exc_traceback)
+
+    def handle_tk_exception(exc_type, exc_value, exc_traceback) -> None:
+        log_exception("Tk 回调异常", exc_type, exc_value, exc_traceback)
+
+    sys.excepthook = lambda exc_type, exc_value, exc_traceback: log_exception(
+        "未捕获异常",
+        exc_type,
+        exc_value,
+        exc_traceback,
+    )
+    threading.excepthook = handle_thread_exception
+    root.report_callback_exception = handle_tk_exception
+
+
 def main() -> None:
     if not _is_admin():
         if _show_admin_prompt():
@@ -75,6 +101,7 @@ def main() -> None:
     import tkinter as tk
 
     root = tk.Tk()
+    _install_exception_hooks(root)
     icon_path = _get_resource_path("icon", "icon.ico")
     if os.path.exists(icon_path):
         try:

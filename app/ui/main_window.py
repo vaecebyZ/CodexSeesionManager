@@ -1,6 +1,8 @@
 import tkinter as tk
 from tkinter import messagebox, ttk
+from queue import Empty, Queue
 from threading import Thread
+from typing import Callable
 
 from app.models import SessionViewData
 from app.services.chatgpt_service import ChatGPTService
@@ -18,11 +20,15 @@ class MainWindow:
         self.attach_monitor_job = None
         self.attach_active = False
         self.chrome_pid = None
+        self._ui_queue: Queue[Callable[[], None]] = Queue()
+        self._closing = False
         self.root.title("Codex Session Manager")
         self.root.minsize(800, 600)
 
         self._build_ui()
         self._center_window(800, 600)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(50, self._drain_ui_queue)
 
     def _build_ui(self) -> None:
         style = ttk.Style()
@@ -91,6 +97,33 @@ class MainWindow:
         y = (screen_height - height) // 2
         self.root.geometry(f"{width}x{height}+{x}+{y}")
 
+    def _post_ui(self, callback: Callable[[], None]) -> None:
+        if self._closing:
+            return
+        self._ui_queue.put(callback)
+
+    def _drain_ui_queue(self) -> None:
+        if self._closing:
+            return
+        try:
+            while True:
+                callback = self._ui_queue.get_nowait()
+                try:
+                    callback()
+                except Exception as exc:
+                    print(f"[MainWindow] UI 回调异常: {exc}", flush=True)
+        except Empty:
+            pass
+        try:
+            if not self._closing:
+                self.root.after(50, self._drain_ui_queue)
+        except tk.TclError:
+            pass
+
+    def _on_close(self) -> None:
+        self._closing = True
+        self.root.destroy()
+
     def open_browser(self) -> None:
         self.open_button.config(state="disabled")
         Thread(target=self._open_worker, daemon=True).start()
@@ -101,11 +134,11 @@ class MainWindow:
 
     def _open_worker(self) -> None:
         message = self.chatgpt_service.open_browser(self.chrome_service)
-        self.root.after(0, lambda: self._apply_open_result(message))
+        self._post_ui(lambda: self._apply_open_result(message))
 
     def _attach_worker(self) -> None:
         view_data, message = self.chatgpt_service.attach_and_fetch(self.chrome_service)
-        self.root.after(0, lambda: self._apply_attach_result(view_data, message))
+        self._post_ui(lambda: self._apply_attach_result(view_data, message))
 
     def _apply_open_result(self, message: str) -> None:
         try:

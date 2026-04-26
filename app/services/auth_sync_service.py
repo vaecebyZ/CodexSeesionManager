@@ -124,7 +124,10 @@ class AuthSyncService:
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
-            self._sync_once()
+            try:
+                self._sync_once()
+            except Exception as exc:
+                print(f"[AuthSync] 后台线程异常: {exc}\n{traceback.format_exc()}", flush=True)
             self._stop_event.wait(self.interval_seconds)
 
     def _get_file_signature(self, path: Path) -> tuple[int, int] | None:
