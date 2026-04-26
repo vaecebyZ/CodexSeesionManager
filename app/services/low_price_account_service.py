@@ -1,0 +1,181 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from html.parser import HTMLParser
+from urllib.parse import urlencode, unquote
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
+
+
+@dataclass(frozen=True, slots=True)
+class LowPriceAccount:
+    product_id: str
+    title: str
+    price: str
+    sales: str
+    href: str = ""
+
+
+class _LowPriceAccountParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.items: list[LowPriceAccount] = []
+        self._depth = 0
+        self._item_depth = 0
+        self._current: dict[str, str] | None = None
+        self._capture_key = ""
+        self._capture_tag = ""
+        self._capture_depth = 0
+        self._capture_parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self._depth += 1
+        attr_map = {key: value or "" for key, value in attrs}
+        classes = attr_map.get("class", "")
+        if tag == "li" and self._has_class(classes, "section-list__item"):
+            self._current = {}
+            self._item_depth = self._depth
+            return
+        if self._current is None:
+            return
+
+        if tag == "a" and attr_map.get("product_id"):
+            self._current["product_id"] = attr_map.get("product_id", "")
+            self._current["title"] = attr_map.get("title", "")
+            self._current["href"] = attr_map.get("href", "")
+            return
+        if tag == "span" and self._has_class(classes, "title-bold"):
+            self._begin_capture("price", tag)
+            return
+        if (
+            tag == "span"
+            and self._has_class(classes, "footnote-regular")
+            and (self._has_class(classes, "color-text-tertiary") or self._has_class(classes, "card-secondary-text"))
+        ):
+            self._begin_capture("sales", tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        if self._current is not None and self._capture_key and tag == self._capture_tag and self._depth == self._capture_depth:
+            value = self._normalize_text("".join(self._capture_parts))
+            if self._capture_key != "sales" or value.lower().startswith("sold"):
+                if self._capture_key == "sales":
+                    value = self._normalize_sales(value)
+                self._current[self._capture_key] = value
+            self._capture_key = ""
+            self._capture_tag = ""
+            self._capture_depth = 0
+            self._capture_parts = []
+
+        if self._current is not None and tag == "li" and self._depth == self._item_depth:
+            product_id = self._current.get("product_id", "")
+            title = self._current.get("title", "")
+            if product_id and title:
+                self.items.append(
+                    LowPriceAccount(
+                        product_id=product_id,
+                        title=title,
+                        price=self._current.get("price", ""),
+                        sales=self._current.get("sales", ""),
+                        href=self._current.get("href", ""),
+                    )
+                )
+            self._current = None
+            self._item_depth = 0
+
+        self._depth = max(self._depth - 1, 0)
+
+    def handle_data(self, data: str) -> None:
+        if self._capture_key:
+            self._capture_parts.append(data)
+
+    def _begin_capture(self, key: str, tag: str) -> None:
+        self._capture_key = key
+        self._capture_tag = tag
+        self._capture_depth = self._depth
+        self._capture_parts = []
+
+    def _has_class(self, classes: str, expected: str) -> bool:
+        return expected in classes.split()
+
+    def _normalize_text(self, value: str) -> str:
+        return " ".join(value.replace("\xa0", " ").split())
+
+    def _normalize_sales(self, value: str) -> str:
+        if value.lower().startswith("sold"):
+            return value[4:].strip()
+        return value
+
+
+class LowPriceAccountService:
+    URL = "https://plati.market/asp/block_goods_category_2.asp"
+    COOKIE = (
+        "language=en%2DUS; vz=b441d9a3%2D83bf%2D4135%2D92b6%2D83f69e6fe366; "
+        "customerid=58dd3bd0f59740e5aa7d736c6f723b07; curr=USD; __ddg1_=bFxxT4IGHcCLSxg6vH7E; "
+        "digiseller-currency=USD; __ddgid_=j0SEQJjyvawclzJc; __ddg2_=rz5Do54N0zmmbp58; "
+        "email=251708339%40qq%2Ecom; uid=90C5F520%2DAE5B%2D4C08%2DB3FC%2D6B5A94F560AF; "
+        "_ga=GA1.1.1917781672.1761410754; _ga_33RMCM93S8=GS2.1.s1776000174$o1$g1$t1776000221$j13$l0$h0; "
+        "_ga_698HPYCMKC=GS2.1.s1776584100$o6$g0$t1776584100$j60$l0$h1824466282; "
+        "ASPSESSIONIDCAACCCDS=KDPBKHADIGECMDPJBAKEFEJB; ASPSESSIONIDSACQCQSR=DJGPGPADFOIMEDLPMEMFEAID; "
+        "ASPSESSIONIDSSRSARST=BHLKMCPCKNKBLMNKOCKHHHBL; ASPSESSIONIDQSDDBRQR=IIFOPFADKPFHDIKNFGIEKOEA; "
+        "ASPSESSIONIDAQCAAQSS=NBBIKCADFKFDHOBDKCNBOKIN; __ddg9_=83.229.122.128; lastsrch=chatgpt; "
+        "_ym_d=1777216976; _ym_isad=2; _ym_visorc=b; items_list_view=grid; "
+        "_ga_2WF69VW4C9=GS2.1.s1777216973$o59$g1$t1777217327$j60$l0$h0; __ddg10_=1777217332; "
+        "__ddg8_=sFcnqwjvfhL3P32g"
+    )
+
+    def fetch_accounts(self, proxy_url: str = "", page: int = 1, rows: int = 24) -> list[LowPriceAccount]:
+        language, currency = self._parse_cookie_settings(self.COOKIE)
+        query = urlencode(
+            {
+                "id_cb": "1267",
+                "id_c": "0",
+                "sort": "price",
+                "page": str(max(page, 1)),
+                "rows": str(rows),
+                "curr": currency.lower(),
+                "lang": language.split("-", 1)[0].lower(),
+            }
+        )
+        request = Request(
+            f"{self.URL}?{query}",
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": language,
+                "Cookie": self.COOKIE,
+                "X-Currency": currency,
+            },
+        )
+        opener = self._build_opener(proxy_url)
+        response_context = opener.open(request, timeout=20) if opener is not None else urlopen(request, timeout=20)
+        with response_context as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            html = response.read().decode(charset, "replace")
+
+        parser = _LowPriceAccountParser()
+        parser.feed(html)
+        return parser.items
+
+    def _build_opener(self, proxy_url: str):
+        normalized = self._normalize_proxy_url(proxy_url)
+        if not normalized:
+            return None
+        return build_opener(ProxyHandler({"http": normalized, "https": normalized}))
+
+    def _normalize_proxy_url(self, proxy_url: str) -> str:
+        value = proxy_url.strip()
+        if not value:
+            return ""
+        if "://" not in value:
+            value = f"http://{value}"
+        return value
+
+    def _parse_cookie_settings(self, cookie: str) -> tuple[str, str]:
+        values: dict[str, str] = {}
+        for part in cookie.split(";"):
+            if "=" not in part:
+                continue
+            key, value = part.strip().split("=", 1)
+            values[key] = unquote(value)
+        language = values.get("language") or "en-US"
+        currency = values.get("digiseller-currency") or values.get("curr") or "USD"
+        return language, currency
