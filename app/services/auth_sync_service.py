@@ -25,6 +25,7 @@ class AuthFileRow:
     quota_refresh_time_7d: str = ""
     traffic: int = 0
     current: bool = False
+    disabled: bool = False
     file_name: str = ""
     access_token: str = ""
 
@@ -55,6 +56,7 @@ class AuthSyncService:
         self._quota_refresh_time_7d_by_refresh_token: dict[str, str] = {}
         self._traffic_by_refresh_token: dict[str, int] = {}
         self._access_token_to_refresh_token: dict[str, str] = {}
+        self._disabled_refresh_tokens: set[str] = set()
 
     def set_change_callback(self, callback: Callable[[], None] | None) -> None:
         self._on_change = callback
@@ -279,6 +281,7 @@ class AuthSyncService:
             self._quota_refresh_time_5h_by_refresh_token.pop(refresh_token, None)
             self._quota_refresh_time_7d_by_refresh_token.pop(refresh_token, None)
             self._traffic_by_refresh_token.pop(refresh_token, None)
+            self._disabled_refresh_tokens.discard(refresh_token)
             self._access_token_to_refresh_token = {
                 access_token: mapped_refresh_token
                 for access_token, mapped_refresh_token in self._access_token_to_refresh_token.items()
@@ -296,6 +299,28 @@ class AuthSyncService:
                 print(f"[AuthSync] 删除回调异常: {exc}\n{traceback.format_exc()}", flush=True)
         return True, ""
 
+    def set_auth_disabled(self, refresh_token: str, disabled: bool) -> tuple[bool, str]:
+        if not refresh_token:
+            return False, "刷新令牌不能为空。"
+
+        self.target_dir.mkdir(parents=True, exist_ok=True)
+        target_path = self.target_dir / f"{refresh_token}.json"
+        if not target_path.exists():
+            return False, f"找不到文件: {target_path}"
+
+        with self._state_lock:
+            if disabled:
+                self._disabled_refresh_tokens.add(refresh_token)
+            else:
+                self._disabled_refresh_tokens.discard(refresh_token)
+
+        if self._on_change is not None:
+            try:
+                self._on_change()
+            except Exception as exc:
+                print(f"[AuthSync] 禁用状态回调异常: {exc}\n{traceback.format_exc()}", flush=True)
+        return True, ""
+
     def list_auth_rows(self) -> list[AuthFileRow]:
         current_state = self._read_source_state()
         current_refresh_token = current_state["refresh_token"] if current_state is not None else ""
@@ -309,6 +334,7 @@ class AuthSyncService:
             quota_refresh_time_5h_by_refresh_token = dict(self._quota_refresh_time_5h_by_refresh_token)
             quota_refresh_time_7d_by_refresh_token = dict(self._quota_refresh_time_7d_by_refresh_token)
             traffic_by_refresh_token = dict(self._traffic_by_refresh_token)
+            disabled_refresh_tokens = set(self._disabled_refresh_tokens)
         if not self.target_dir.exists():
             return rows
 
@@ -338,6 +364,7 @@ class AuthSyncService:
                     quota_refresh_time_7d=quota_refresh_time_7d_by_refresh_token.get(refresh_token, ""),
                     traffic=traffic_by_refresh_token.get(refresh_token, 0),
                     current=refresh_token == current_refresh_token,
+                    disabled=refresh_token in disabled_refresh_tokens,
                     file_name=path.name,
                     access_token=access_token,
                 )

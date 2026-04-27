@@ -121,7 +121,7 @@ class ProxyWindow:
         self._ui_queue: Queue[Callable[[], None]] = Queue()
         self._closing = False
         self._last_install_rows_signature: tuple[tuple[str, str, str, str], ...] | None = None
-        self._last_auth_rows_signature: tuple[tuple[bool, bool, str, str, str, str, str, int], ...] | None = None
+        self._last_auth_rows_signature: tuple[tuple[bool, bool, bool, str, str, str, str, str, int], ...] | None = None
         self._tray_icon_visible = False
         self._tray_icon: pystray.Icon | None = None
 
@@ -293,6 +293,7 @@ class ProxyWindow:
         self.auth_tree.bind("<Leave>", lambda _event: self._hide_tooltip())
         self._auth_menu = tk.Menu(self.root, tearoff=0)
         self._auth_menu.add_command(label="切换", command=self._activate_selected_auth_row)
+        self._auth_menu.add_command(label="禁用", command=self._toggle_selected_auth_row_disabled)
         self._auth_menu.add_command(label="删除", command=self._delete_selected_auth_row)
 
         auth_scroll = ttk.Scrollbar(auth_wrap, orient="vertical", command=self.auth_tree.yview)
@@ -567,6 +568,7 @@ class ProxyWindow:
             current_refresh_token = self._auto_load_target_refresh_token
             current_access_token = self._auto_load_target_access_token
         rows = self.auth_sync_service.list_auth_rows()
+        rows = [row for row in rows if not row.disabled]
         if not rows:
             self._set_auto_load_target("", "")
             self._clear_proxy_kill_pending()
@@ -1372,7 +1374,7 @@ class ProxyWindow:
                 "end",
                 values=(
                     "★" if row.current else "",
-                    "●" if row.refresh_token == load_refresh_token else "",
+                    "¤" if row.disabled else "●" if row.refresh_token == load_refresh_token else "",
                     self._shorten_middle(row.account_id, 16, 10),
                     self._format_last_refresh(row.last_refresh),
                     self._format_last_refresh(row.quota_refresh_time_5h),
@@ -1390,6 +1392,7 @@ class ProxyWindow:
         signature = tuple(
             (
                 row.current,
+                row.disabled,
                 row.refresh_token == load_refresh_token,
                 row.account_id,
                 row.last_refresh,
@@ -1545,6 +1548,7 @@ class ProxyWindow:
             f"额度(5h/7d): {quota}",
             f"类型: {row.plan_type or ''}",
             f"流量: {traffic}",
+            f"状态: {'禁用' if row.disabled else '启用'}",
         ]
         return "\n".join(lines)
 
@@ -1603,6 +1607,7 @@ class ProxyWindow:
             return
         self.auth_tree.selection_set(row_id)
         self.auth_tree.focus(row_id)
+        self._auth_menu.entryconfig(1, label="启用" if row.disabled else "禁用")
         try:
             self._auth_menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -1621,6 +1626,11 @@ class ProxyWindow:
         row = self._get_selected_auth_row()
         if row is not None:
             self._delete_auth_row(row)
+
+    def _toggle_selected_auth_row_disabled(self) -> None:
+        row = self._get_selected_auth_row()
+        if row is not None:
+            self._set_auth_row_disabled(row, not row.disabled)
 
     def _get_selected_auth_row(self) -> AuthFileRow | None:
         selection = self.auth_tree.selection()
@@ -1648,6 +1658,18 @@ class ProxyWindow:
             self._set_auto_load_target("", "")
             if self.auto_load_var.get():
                 self._recompute_auto_load_target()
+        self.refresh_auth_files()
+
+    def _set_auth_row_disabled(self, row: AuthFileRow, disabled: bool) -> None:
+        ok, message = self.auth_sync_service.set_auth_disabled(row.refresh_token, disabled)
+        if not ok:
+            messagebox.showerror("更新状态失败", message)
+            return
+        if disabled and row.refresh_token == self._get_auto_load_target_refresh_token():
+            self._set_auto_load_target("", "")
+            self._clear_proxy_kill_pending()
+        if self.auto_load_var.get():
+            self._recompute_auto_load_target()
         self.refresh_auth_files()
 
     def _show_tooltip(self, x: int, y: int, text: str) -> None:
