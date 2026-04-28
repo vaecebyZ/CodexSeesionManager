@@ -23,7 +23,7 @@ from PIL import Image
 
 from app.services.auth_sync_service import AuthFileRow, AuthSyncService
 from app.services.app_config_service import AppConfig, AppConfigService
-from app.services.auth_usage_service import AuthUsageService
+from app.services.auth_usage_service import AuthQuotaItem, AuthUsageService
 from app.services.low_price_account_service import LowPriceAccount, LowPriceAccountService
 from tkinter import messagebox, ttk
 
@@ -98,6 +98,9 @@ class ProxyWindow:
         self._proxy_kill_attempt_in_flight = False
         self._manual_proxy_kill_pending = False
         self._correct_traffic_button: ttk.Button | None = None
+        self._correct_traffic_refreshing = False
+        self._clean_auth_button: ttk.Button | None = None
+        self._clean_auth_refreshing = False
         self._low_price_window: tk.Toplevel | None = None
         self._low_price_tree: ttk.Treeview | None = None
         self._low_price_refresh_button: ttk.Button | None = None
@@ -242,6 +245,8 @@ class ProxyWindow:
         ttk.Checkbutton(auth_options, text="自动负载", variable=self.auto_load_var, command=self._on_auto_load_toggled).pack(side="left")
         self._correct_traffic_button = ttk.Button(auth_options, text="矫正流量", command=self.correct_traffic)
         self._correct_traffic_button.pack(side="right")
+        self._clean_auth_button = ttk.Button(auth_options, text="清理授权", command=self.clean_auth_files)
+        self._clean_auth_button.pack(side="right", padx=(0, 8))
         update_auth_button = ttk.Button(auth_options, text="更新授权", command=self.update_auth)
         update_auth_button.pack(side="right", padx=(0, 8))
         low_price_button = ttk.Button(auth_options, text="低价购号", command=self.open_low_price_window)
@@ -253,6 +258,10 @@ class ProxyWindow:
         self._bind_widget_tooltip(
             update_auth_button,
             "更新授权文件",
+        )
+        self._bind_widget_tooltip(
+            self._clean_auth_button,
+            "清理同账户重复授权",
         )
 
         auth_wrap = ttk.Frame(auth_frame)
@@ -999,8 +1008,80 @@ class ProxyWindow:
         self._launch_codex(launch_row)
 
     def correct_traffic(self) -> None:
+        if self._correct_traffic_refreshing:
+            return
+        self._correct_traffic_refreshing = True
+        if self._correct_traffic_button is not None:
+            self._correct_traffic_button.config(text="刷新额度中", state="disabled")
+        Thread(target=self._refresh_quota_before_correct_traffic_worker, daemon=True).start()
+
+    def _refresh_quota_before_correct_traffic_worker(self) -> None:
+        error = ""
+        try:
+            self.auth_usage_service.refresh_once()
+        except Exception as exc:
+            error = str(exc)
+        try:
+            self._post_ui(lambda value=error: self._finish_correct_traffic_quota_refresh(value))
+        except tk.TclError:
+            pass
+
+    def _finish_correct_traffic_quota_refresh(self, error: str) -> None:
+        self._correct_traffic_refreshing = False
+        if error:
+            print(f"[ProxyWindow] 矫正流量前刷新额度失败: {error}", flush=True)
+        self._apply_pending_quota_items()
+        self.refresh_auth_files(update_status=False)
         self._request_manual_proxy_kill()
         self._start_correct_traffic_countdown()
+
+    def clean_auth_files(self) -> None:
+        if self._clean_auth_refreshing:
+            return
+        self._clean_auth_refreshing = True
+        if self._clean_auth_button is not None:
+            self._clean_auth_button.config(text="刷新额度中", state="disabled")
+        Thread(target=self._clean_auth_files_worker, daemon=True).start()
+
+    def _clean_auth_files_worker(self) -> None:
+        refreshed_items: list[AuthQuotaItem] = []
+        error = ""
+        try:
+            refreshed_items = self.auth_usage_service.refresh_once()
+        except Exception as exc:
+            error = str(exc)
+        try:
+            self._post_ui(lambda items=refreshed_items, value=error: self._finish_clean_auth_refresh(items, value))
+        except tk.TclError:
+            pass
+
+    def _finish_clean_auth_refresh(self, refreshed_items: list[AuthQuotaItem], error: str) -> None:
+        self._clean_auth_refreshing = False
+        if self._clean_auth_button is not None:
+            self._clean_auth_button.config(text="清理授权", state="normal")
+        if error:
+            messagebox.showerror("清理授权失败", f"刷新额度失败: {error}")
+            return
+
+        self._apply_pending_quota_items()
+        rows = self.auth_sync_service.list_auth_rows()
+        refreshed_tokens = {
+            item.refresh_token
+            for item in refreshed_items
+            if item.refresh_token and self._is_normal_quota(item.quota)
+        }
+        delete_rows = self._build_clean_auth_delete_rows(rows, refreshed_tokens)
+        self._print_clean_auth_plan(rows, refreshed_tokens, delete_rows)
+        self.refresh_auth_files(update_status=False)
+
+        if not delete_rows:
+            messagebox.showinfo("清理授权", "没有发现需要清理的无效或重复授权。")
+            return
+
+        message = self._build_clean_auth_confirm_message(delete_rows)
+        if not messagebox.askyesno("清理授权", message):
+            return
+        self._delete_clean_auth_rows(delete_rows)
 
     def open_low_price_window(self) -> None:
         if self._low_price_window is not None and self._low_price_window.winfo_exists():
@@ -1516,6 +1597,125 @@ class ProxyWindow:
             return float(match.group(1))
         except ValueError:
             return -1.0
+
+    def _is_normal_quota(self, quota: str) -> bool:
+        value = quota.strip()
+        return bool(value and value != "—")
+
+    def _last_refresh_sort_key(self, text: str) -> float:
+        if not text:
+            return 0.0
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
+
+    def _build_clean_auth_delete_rows(
+        self,
+        rows: list[AuthFileRow],
+        refreshed_tokens: set[str],
+    ) -> list[AuthFileRow]:
+        delete_rows_by_token: dict[str, AuthFileRow] = {
+            row.refresh_token: row
+            for row in rows
+            if row.refresh_token and row.refresh_token not in refreshed_tokens
+        }
+        rows_by_account_id: dict[str, list[AuthFileRow]] = {}
+        for row in rows:
+            if not row.account_id:
+                continue
+            rows_by_account_id.setdefault(row.account_id, []).append(row)
+
+        for account_rows in rows_by_account_id.values():
+            if len(account_rows) <= 1:
+                continue
+            normal_rows = [row for row in account_rows if row.refresh_token in refreshed_tokens]
+            if not normal_rows:
+                continue
+            keep_row = max(normal_rows, key=lambda item: (self._last_refresh_sort_key(item.last_refresh), item.refresh_token))
+            for row in account_rows:
+                if row.refresh_token != keep_row.refresh_token:
+                    delete_rows_by_token[row.refresh_token] = row
+        return list(delete_rows_by_token.values())
+
+    def _print_clean_auth_plan(
+        self,
+        rows: list[AuthFileRow],
+        refreshed_tokens: set[str],
+        delete_rows: list[AuthFileRow],
+    ) -> None:
+        delete_tokens = {row.refresh_token for row in delete_rows}
+        print("[ProxyWindow] 清理授权刷新成功队列:", flush=True)
+        for row in rows:
+            if row.refresh_token not in refreshed_tokens:
+                continue
+            print(
+                f"  account_id={row.account_id} refresh_token={row.refresh_token} "
+                f"last_refresh={row.last_refresh} quota={row.quota}",
+                flush=True,
+            )
+        print("[ProxyWindow] 清理授权待删除队列:", flush=True)
+        if not delete_rows:
+            print("  无", flush=True)
+            return
+        for row in delete_rows:
+            print(
+                f"  account_id={row.account_id} refresh_token={row.refresh_token} "
+                f"last_refresh={row.last_refresh} quota={row.quota} "
+                f"{'current' if row.current else ''} {'disabled' if row.disabled else ''}",
+                flush=True,
+            )
+        kept_rows = [row for row in rows if row.account_id and row.refresh_token not in delete_tokens]
+        print("[ProxyWindow] 清理授权保留队列:", flush=True)
+        for row in kept_rows:
+            if any(item.account_id == row.account_id for item in delete_rows):
+                print(
+                    f"  account_id={row.account_id} refresh_token={row.refresh_token} "
+                    f"last_refresh={row.last_refresh} quota={row.quota}",
+                    flush=True,
+                )
+
+    def _build_clean_auth_confirm_message(self, delete_rows: list[AuthFileRow]) -> str:
+        lines = [
+            "确认清理无效授权吗？",
+            "",
+            f"将删除 {len(delete_rows)} 个授权文件：额度刷新失败的授权会被清理；同账户多个授权都有效时，仅保留令牌刷新时间最新的授权。",
+            "",
+            "待删除:",
+        ]
+        for row in delete_rows[:12]:
+            lines.append(
+                f"- {self._shorten_middle(row.account_id, 16, 10)} "
+                f"{self._format_last_refresh(row.last_refresh)} "
+                f"{self._redact_middle(row.refresh_token)}"
+            )
+        if len(delete_rows) > 12:
+            lines.append(f"... 其余 {len(delete_rows) - 12} 个已打印到日志")
+        return "\n".join(lines)
+
+    def _delete_clean_auth_rows(self, delete_rows: list[AuthFileRow]) -> None:
+        deleted_tokens: set[str] = set()
+        errors: list[str] = []
+        for row in delete_rows:
+            ok, message = self.auth_sync_service.delete_auth_file(row.refresh_token)
+            if ok:
+                deleted_tokens.add(row.refresh_token)
+                continue
+            errors.append(f"{row.refresh_token}: {message}")
+
+        if self._get_auto_load_target_refresh_token() in deleted_tokens:
+            self._set_auto_load_target("", "")
+        self.auth_usage_service.remove_tokens(deleted_tokens)
+        for refresh_token in deleted_tokens:
+            self._quota_priority_by_refresh_token.pop(refresh_token, None)
+        if self.auto_load_var.get():
+            self._recompute_auto_load_target()
+        self.refresh_auth_files(update_status=False)
+
+        if errors:
+            messagebox.showerror("清理授权失败", "\n".join(errors[:8]))
+            return
+        messagebox.showinfo("清理授权", f"已清理 {len(deleted_tokens)} 个授权文件。")
 
     def _format_last_refresh(self, text: str) -> str:
         if not text:

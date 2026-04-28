@@ -77,6 +77,9 @@ class AuthUsageService:
     def request_refresh(self) -> None:
         self._refresh_event.set()
 
+    def refresh_once(self) -> list[AuthQuotaItem]:
+        return self._refresh_once()
+
     def quota_for(self, refresh_token: str) -> str:
         with self._quota_lock:
             item = self._quota_items_by_token.get(refresh_token)
@@ -103,6 +106,13 @@ class AuthUsageService:
                 refresh_token: AuthQuotaItem(refresh_token=refresh_token, account_id="", quota=quota)
                 for refresh_token, quota in cache.items()
             }
+
+    def remove_tokens(self, refresh_tokens: set[str]) -> None:
+        if not refresh_tokens:
+            return
+        with self._quota_lock:
+            for refresh_token in refresh_tokens:
+                self._quota_items_by_token.pop(refresh_token, None)
 
     def pop_pending_quota_items(self) -> list[AuthQuotaItem]:
         latest: list[AuthQuotaItem] = []
@@ -197,14 +207,14 @@ class AuthUsageService:
                 return self._stop_event.is_set()
         return True
 
-    def _refresh_once(self) -> None:
+    def _refresh_once(self) -> list[AuthQuotaItem]:
         try:
             rows = self.auth_sync_service.list_auth_rows()
         except Exception as exc:
             self._log(f"读取授权文件失败: {exc}")
-            return
+            return []
         if not rows:
-            return
+            return []
 
         with self._quota_lock:
             cache = {refresh_token: item.quota for refresh_token, item in self._quota_items_by_token.items()}
@@ -227,7 +237,7 @@ class AuthUsageService:
                     continue
                 refresh_rows.append((row.refresh_token, row.account_id, row.access_token))
             if not refresh_rows:
-                return
+                return []
             with ThreadPoolExecutor(max_workers=len(refresh_rows), thread_name_prefix="auth-quota") as executor:
                 futures = [
                     executor.submit(
@@ -244,9 +254,13 @@ class AuthUsageService:
                     )
                     for refresh_token, account_id, access_token in refresh_rows
                 ]
+        refreshed_items: list[AuthQuotaItem] = []
         for future in futures:
             try:
-                changed = future.result() or changed
+                item = future.result()
+                if item is not None:
+                    refreshed_items.append(item)
+                    changed = True
             except Exception as exc:
                 self._log(f"额度刷新线程异常: {exc}\n{traceback.format_exc()}")
 
@@ -255,6 +269,7 @@ class AuthUsageService:
                 self._on_quota_change()
             if self._on_change is not None:
                 self._on_change()
+        return refreshed_items
 
     def _refresh_row(
         self,
@@ -267,12 +282,12 @@ class AuthUsageService:
         email_cache: dict[str, str],
         quota_refresh_time_cache: dict[str, str],
         quota_refresh_time_7d_cache: dict[str, str],
-    ) -> bool:
+    ) -> AuthQuotaItem | None:
         result = self.fetcher.fetch(access_token, account_id)
         if not result.quota:
             if result.message:
                 self._log(f"额度刷新失败: refresh_token={refresh_token} message={result.message}")
-            return False
+            return None
 
         plan_type = result.plan_type or plan_type_cache.get(refresh_token, "")
         user_id = result.user_id or user_id_cache.get(refresh_token, "")
@@ -299,4 +314,4 @@ class AuthUsageService:
             )
             self._quota_items_by_token[refresh_token] = item
         self._pending_items.put(item)
-        return True
+        return item
