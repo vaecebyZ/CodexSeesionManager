@@ -1143,7 +1143,7 @@ class ProxyWindow:
     def _refresh_low_price_accounts_worker(self, proxy_url: str) -> None:
         try:
             items_by_product_id: dict[str, LowPriceAccount] = {}
-            for page in range(1, 4):
+            for page in range(1, 6):
                 for item in self.low_price_account_service.fetch_accounts(proxy_url, page=page):
                     items_by_product_id.setdefault(item.product_id, item)
             items = list(items_by_product_id.values())
