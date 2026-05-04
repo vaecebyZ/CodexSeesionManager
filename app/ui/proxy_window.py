@@ -36,6 +36,7 @@ _QUOTA_DROP_GRACE_SECONDS = 10.0
 _TRAY_ICON_TIP = "Codex 账户管理"
 _TRAY_ICON_MAX_ROWS = 4
 _TRAY_ICON_MAX_TIP_LENGTH = 120
+_TRAY_WATCHDOG_INTERVAL_MS = 5000
 
 
 @dataclass
@@ -131,6 +132,7 @@ class ProxyWindow:
         self._build_ui()
         self.root.bind("<Unmap>", self._on_root_unmap, add="+")
         self.root.after(50, self._drain_ui_queue)
+        self.root.after(_TRAY_WATCHDOG_INTERVAL_MS, self._tray_icon_watchdog)
         self.auth_sync_service.set_change_callback(lambda: self._post_ui(self._schedule_refresh_auth_files))
         self.auth_usage_service.set_change_callback(lambda: self._post_ui(self._schedule_refresh_auth_files))
         self.auth_usage_service.set_quota_change_callback(
@@ -2018,6 +2020,25 @@ class ProxyWindow:
             return f"{size_bytes / (1024 * 1024):.1f}M"
         return f"{size_bytes / (1024 * 1024 * 1024):.1f}G"
 
+    def _tray_icon_watchdog(self) -> None:
+        if self._closing:
+            return
+        self._recover_tray_icon_if_needed()
+        self.root.after(_TRAY_WATCHDOG_INTERVAL_MS, self._tray_icon_watchdog)
+
+    def _recover_tray_icon_if_needed(self) -> None:
+        if self._closing or self.root.state() != "withdrawn":
+            return
+        if self._tray_icon is None or not getattr(self._tray_icon, "visible", False):
+            if self._tray_icon is not None:
+                try:
+                    self._tray_icon.stop()
+                except Exception:
+                    pass
+                self._tray_icon = None
+            self._tray_icon_visible = False
+            self._add_tray_icon()
+
     def _on_root_unmap(self, _event: tk.Event) -> None:
         if not self._tray_icon_visible and self.root.state() == "iconic":
             self.root.after(0, self._hide_to_tray)
@@ -2035,13 +2056,19 @@ class ProxyWindow:
     def _add_tray_icon(self) -> None:
         if self._tray_icon_visible:
             return
+        if self._tray_icon is not None:
+            try:
+                self._tray_icon.stop()
+            except Exception:
+                pass
+            self._tray_icon = None
         menu = pystray.Menu(pystray.MenuItem("显示", self._on_tray_show, default=True))
         self._tray_icon = pystray.Icon(_TRAY_ICON_TIP, self._load_tray_icon(), self._build_tray_icon_tip(), menu)
         self._tray_icon.run_detached()
         self._tray_icon_visible = True
 
     def _remove_tray_icon(self) -> None:
-        if not self._tray_icon_visible:
+        if not self._tray_icon_visible and self._tray_icon is None:
             return
         if self._tray_icon is not None:
             self._tray_icon.stop()
