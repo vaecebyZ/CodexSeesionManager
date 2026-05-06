@@ -15,6 +15,12 @@ Codex Session Manager 是一个面向 Windows 的 Codex 账户管理工具，核
 - 检测到旧长连接仍在消耗非目标 token 时，会等待 WebSocket ping/pong 时机断开旧连接。
 - UI 中用“当前”和“负载”两列区分源授权文件和自动负载目标。
 
+## 界面预览
+
+![Codex 账户管理工具界面](images/20260506-175311.png)
+
+界面上方用于管理本地代理和启动已安装的 Codex 程序；下方授权表集中展示 Codex session 的当前授权、自动负载目标、额度刷新时间、额度类型和实际流量。保持“自动负载”开启后，程序会根据额度自动选择“负载”列标记的 session。
+
 ## 自动负载的工作方式
 
 程序启动后会创建一个本地 mitmproxy 代理，并启动一个内部控制通道。Codex 进程通过该代理访问网络时，代理插件会把请求中的 `Bearer accessToken` 替换为当前自动负载选中的 access token。
