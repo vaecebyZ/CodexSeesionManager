@@ -1,0 +1,89 @@
+name: Build and Release Windows EXE
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag. Leave empty to use current China time, for example 202605061739."
+        required: false
+        type: string
+      release_name:
+        description: "Release title. Leave empty to use the tag."
+        required: false
+        type: string
+      prerelease:
+        description: "Mark this release as a prerelease."
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install -r requirement.txt
+
+      - name: Prepare build variables
+        id: vars
+        shell: pwsh
+        run: |
+          $chinaTimeZone = [TimeZoneInfo]::FindSystemTimeZoneById("China Standard Time")
+          $now = [TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $chinaTimeZone)
+          $timestamp = $now.ToString("yyyyMMddHHmm")
+          $tagName = "${{ inputs.tag_name }}"
+          if ([string]::IsNullOrWhiteSpace($tagName)) {
+            $tagName = $timestamp
+          }
+          $releaseName = "${{ inputs.release_name }}"
+          if ([string]::IsNullOrWhiteSpace($releaseName)) {
+            $releaseName = $tagName
+          }
+          $buildExeDir = Join-Path $env:GITHUB_WORKSPACE "build\CodexSeesionManager.$timestamp"
+          $zipPath = Join-Path $env:GITHUB_WORKSPACE "CodexSeesionManager-$tagName-windows-x64.zip"
+          "BUILD_EXE_DIR=$buildExeDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ZIP_PATH=$zipPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "tag_name=$tagName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "release_name=$releaseName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Build executable
+        shell: pwsh
+        run: python setup.py build
+
+      - name: Package build
+        shell: pwsh
+        run: |
+          if (!(Test-Path "$env:BUILD_EXE_DIR\codex_session.exe")) {
+            throw "codex_session.exe was not generated."
+          }
+          Compress-Archive -Path "$env:BUILD_EXE_DIR\*" -DestinationPath "$env:ZIP_PATH" -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodexSeesionManager-windows-x64
+          path: ${{ env.ZIP_PATH }}
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.tag_name }}
+          name: ${{ steps.vars.outputs.release_name }}
+          prerelease: ${{ inputs.prerelease }}
+          files: ${{ env.ZIP_PATH }}
