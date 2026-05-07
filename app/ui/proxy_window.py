@@ -6,7 +6,6 @@ import re
 import socket
 import subprocess
 import shutil
-import tempfile
 import sys
 import time
 import tkinter as tk
@@ -1964,25 +1963,33 @@ class ProxyWindow:
             messagebox.showerror("启动失败", message)
             return
         proxy_port = self.service.config.port
-        script = (
-            "@echo off\r\n"
-            'if "%~1"=="" exit /b 1\r\n'
-            'cd /d "%~1"\r\n'
-            f"set HTTP_PROXY=http://127.0.0.1:{proxy_port}\r\n"
-            f"set HTTPS_PROXY=http://127.0.0.1:{proxy_port}\r\n"
-            f"set ALL_PROXY=http://127.0.0.1:{proxy_port}\r\n"
-            "set NO_PROXY=localhost,127.0.0.1\r\n"
-            f'"{exe}"\r\n'
-        )
+        env = os.environ.copy()
+        env["HTTP_PROXY"] = f"http://127.0.0.1:{proxy_port}"
+        env["HTTPS_PROXY"] = f"http://127.0.0.1:{proxy_port}"
+        env["ALL_PROXY"] = f"http://127.0.0.1:{proxy_port}"
+        env["NO_PROXY"] = "localhost,127.0.0.1"
         current_dir = str(exe.parent)
-        with tempfile.NamedTemporaryFile("w", suffix=".bat", delete=False, encoding="utf-8", newline="\r\n") as batch_file:
-            batch_file.write(script)
-            batch_path = batch_file.name
         print(f"[ProxyWindow] 启动外部程序: {exe.name}", flush=True)
+        if self._is_cli_codex_executable(exe):
+            subprocess.Popen(
+                f'cmd.exe /k ""{exe}""',
+                cwd=current_dir,
+                env=env,
+                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+            )
+            return
         subprocess.Popen(
-            ["cmd.exe", "/k", batch_path, current_dir],
-            creationflags=subprocess.CREATE_NEW_CONSOLE,
+            [str(exe)],
+            cwd=current_dir,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+
+    def _is_cli_codex_executable(self, path: Path) -> bool:
+        return path.name.lower() == "codex.exe" and "\\codex\\codex.exe" in str(path).replace("/", "\\").lower()
 
     def _iter_codex_executables(self, root: Path) -> list[Path]:
         matches: list[Path] = []
