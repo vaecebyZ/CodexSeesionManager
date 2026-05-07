@@ -1499,7 +1499,12 @@ class ProxyWindow:
 
     def _is_supported_codex_executable(self, path: str) -> bool:
         normalized_path = path.replace("/", "\\")
-        return normalized_path.endswith("\\app\\Codex.exe") or normalized_path.endswith("\\codex\\codex.exe")
+        return (
+            normalized_path.endswith("\\app\\Codex.exe")
+            or normalized_path.endswith("\\codex\\codex.exe")
+            or normalized_path.endswith("\\Code.exe")
+            or normalized_path.endswith("\\code.exe")
+        )
 
     def _scan_windowsapps_codex(self) -> list[CodexInstallRow]:
         base_dir = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "WindowsApps"
@@ -1989,7 +1994,8 @@ class ProxyWindow:
         )
 
     def _is_cli_codex_executable(self, path: Path) -> bool:
-        return path.name.lower() == "codex.exe" and "\\codex\\codex.exe" in str(path).replace("/", "\\").lower()
+        normalized_path = str(path).replace("/", "\\").lower()
+        return path.name.lower() == "codex.exe" and normalized_path.endswith("\\codex\\codex.exe")
 
     def _iter_codex_executables(self, root: Path) -> list[Path]:
         matches: list[Path] = []
