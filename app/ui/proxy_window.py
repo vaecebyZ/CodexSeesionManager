@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import re
 import socket
 import subprocess
@@ -36,6 +36,7 @@ _TRAY_ICON_TIP = "Codex 账户管理"
 _TRAY_ICON_MAX_ROWS = 4
 _TRAY_ICON_MAX_TIP_LENGTH = 120
 _TRAY_WATCHDOG_INTERVAL_MS = 5000
+_CHINA_TIMEZONE = timezone(timedelta(hours=8))
 
 
 @dataclass
@@ -1612,7 +1613,7 @@ class ProxyWindow:
         if not text:
             return 0.0
         try:
-            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+            return self._parse_display_datetime(text).timestamp()
         except ValueError:
             return 0.0
 
@@ -1724,13 +1725,25 @@ class ProxyWindow:
         messagebox.showinfo("清理授权", f"已清理 {len(deleted_tokens)} 个授权文件。")
 
     def _format_last_refresh(self, text: str) -> str:
+        return self._format_display_datetime(text, "%Y-%m-%d %H:%M")
+
+    def _format_tooltip_time(self, text: str) -> str:
+        return self._format_display_datetime(text, "%Y-%m-%d %H:%M:%S")
+
+    def _format_display_datetime(self, text: str, fmt: str) -> str:
         if not text:
             return ""
         try:
-            value = datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone()
+            value = self._parse_display_datetime(text)
         except ValueError:
             return text
-        return value.strftime("%Y-%m-%d %H:%M")
+        return value.strftime(fmt)
+
+    def _parse_display_datetime(self, text: str) -> datetime:
+        value = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if value.tzinfo is None:
+            return value
+        return value.astimezone(_CHINA_TIMEZONE)
 
     def _redact_middle(self, text: str, keep_prefix: int = 12, keep_suffix: int = 8) -> str:
         if not text:
@@ -1748,9 +1761,9 @@ class ProxyWindow:
             f"邮箱: {row.email or ''}",
             f"刷新令牌: {row.refresh_token or '-'}",
             f"访问令牌: {row.access_token or ''}",
-            f"令牌刷新时间: {row.last_refresh or ''}",
-            f"额度刷新时间(5小时): {row.quota_refresh_time_5h or ''}",
-            f"额度刷新时间(7天): {row.quota_refresh_time_7d or ''}",
+            f"令牌刷新时间: {self._format_tooltip_time(row.last_refresh)}",
+            f"额度刷新时间(5小时): {self._format_tooltip_time(row.quota_refresh_time_5h)}",
+            f"额度刷新时间(7天): {self._format_tooltip_time(row.quota_refresh_time_7d)}",
             f"额度(5h/7d): {quota}",
             f"类型: {row.plan_type or ''}",
             f"流量: {traffic}",

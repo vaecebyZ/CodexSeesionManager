@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from numbers import Number
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+_CHINA_TIMEZONE = timezone(timedelta(hours=8))
 
 
 @dataclass
@@ -252,9 +255,11 @@ class ChatGPTUsageFetcher:
         return f"{value:.2f}".rstrip("0").rstrip(".")
 
     def _format_epoch_seconds(self, value: float) -> str:
-        from datetime import datetime, timezone
-
-        return datetime.fromtimestamp(value, tz=timezone.utc).isoformat(timespec="seconds")
+        return (
+            datetime.fromtimestamp(value, tz=timezone.utc)
+            .astimezone(_CHINA_TIMEZONE)
+            .strftime("%Y-%m-%d %H:%M:%S")
+        )
 
     def _stringify_value(self, value: str | Number) -> str:
         if isinstance(value, Number):
