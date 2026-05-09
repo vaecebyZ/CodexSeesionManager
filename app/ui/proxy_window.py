@@ -69,7 +69,7 @@ class ProxyWindow:
         self.auth_usage_service = AuthUsageService(self.auth_sync_service)
         self.low_price_account_service = LowPriceAccountService()
         self.root.title("Codex 账户管理工具")
-        self.root.minsize(960, 660)
+        self.root.minsize(1040, 660)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.port_var = tk.StringVar(value=str(self.service.config.port))
@@ -125,12 +125,13 @@ class ProxyWindow:
         self._ui_queue: Queue[Callable[[], None]] = Queue()
         self._closing = False
         self._last_install_rows_signature: tuple[tuple[str, str, str, str], ...] | None = None
-        self._last_auth_rows_signature: tuple[tuple[bool, bool, bool, str, str, str, str, str, int], ...] | None = None
+        self._last_auth_rows_signature: tuple[
+            tuple[bool, bool, bool, str, str, str, str, str, str, int], ...
+        ] | None = None
         self._tray_icon_visible = False
         self._tray_icon: pystray.Icon | None = None
 
         self._build_ui()
-        self.root.bind("<Unmap>", self._on_root_unmap, add="+")
         self.root.after(50, self._drain_ui_queue)
         self.root.after(_TRAY_WATCHDOG_INTERVAL_MS, self._tray_icon_watchdog)
         self.auth_sync_service.set_change_callback(lambda: self._post_ui(self._schedule_refresh_auth_files))
@@ -144,12 +145,13 @@ class ProxyWindow:
         self.auth_usage_service.set_proxy_provider(self._get_proxy_for_usage_request)
         self.auth_sync_service.start()
         self.auth_usage_service.start()
-        self._center_window(960, 660)
+        self._center_window(1040, 660)
         self._load_or_probe_initial_config(loaded_config is not None)
         self._sync_proxy_config_cache()
         self._set_config_editable(True)
         self.refresh_all()
         self._recompute_auto_load_target()
+        self._add_tray_icon()
         self.root.after(500, self._auto_start_with_certificate_check)
 
     def _build_ui(self) -> None:
@@ -273,6 +275,7 @@ class ProxyWindow:
             "currentMark",
             "loadMark",
             "accountId",
+            "email",
             "tokenRefreshTime",
             "quotaRefreshTime",
             "quota",
@@ -283,6 +286,7 @@ class ProxyWindow:
         self.auth_tree.heading("currentMark", text="当前")
         self.auth_tree.heading("loadMark", text="负载")
         self.auth_tree.heading("accountId", text="账户id")
+        self.auth_tree.heading("email", text="邮箱")
         self.auth_tree.heading("tokenRefreshTime", text="令牌刷新时间")
         self.auth_tree.heading("quotaRefreshTime", text="额度刷新时间")
         self.auth_tree.heading("quota", text="额度(5h/7d)")
@@ -290,12 +294,13 @@ class ProxyWindow:
         self.auth_tree.heading("traffic", text="流量")
         self.auth_tree.column("currentMark", width=46, anchor="center", stretch=False)
         self.auth_tree.column("loadMark", width=46, anchor="center", stretch=False)
-        self.auth_tree.column("accountId", width=260, anchor="w", stretch=True)
-        self.auth_tree.column("tokenRefreshTime", width=128, anchor="center", stretch=False)
-        self.auth_tree.column("quotaRefreshTime", width=128, anchor="center", stretch=False)
+        self.auth_tree.column("accountId", width=210, anchor="w", stretch=True)
+        self.auth_tree.column("email", width=190, anchor="w", stretch=True)
+        self.auth_tree.column("tokenRefreshTime", width=124, anchor="center", stretch=False)
+        self.auth_tree.column("quotaRefreshTime", width=124, anchor="center", stretch=False)
         self.auth_tree.column("quota", width=112, anchor="center", stretch=False)
         self.auth_tree.column("planType", width=76, anchor="center", stretch=False)
-        self.auth_tree.column("traffic", width=104, anchor="center", stretch=False)
+        self.auth_tree.column("traffic", width=88, anchor="center", stretch=False)
         self.auth_tree.bind("<Double-1>", self._on_auth_tree_double_click)
         self.auth_tree.bind("<Button-3>", self._on_auth_tree_right_click)
         self.auth_tree.bind("<Delete>", self._on_auth_tree_delete_key)
@@ -1459,6 +1464,7 @@ class ProxyWindow:
                     "★" if row.current else "",
                     "¤" if row.disabled else "●" if row.refresh_token == load_refresh_token else "",
                     self._shorten_middle(row.account_id, 16, 10),
+                    self._shorten_middle(row.email, 18, 12),
                     self._format_last_refresh(row.last_refresh),
                     self._format_last_refresh(row.quota_refresh_time_5h),
                     row.quota,
@@ -1478,6 +1484,7 @@ class ProxyWindow:
                 row.disabled,
                 row.refresh_token == load_refresh_token,
                 row.account_id,
+                row.email,
                 row.last_refresh,
                 row.quota_refresh_time_5h,
                 row.quota,
@@ -2065,16 +2072,11 @@ class ProxyWindow:
             self._tray_icon_visible = False
             self._add_tray_icon()
 
-    def _on_root_unmap(self, _event: tk.Event) -> None:
-        if not self._tray_icon_visible and self.root.state() == "iconic":
-            self.root.after(0, self._hide_to_tray)
-
     def _hide_to_tray(self) -> None:
         self._add_tray_icon()
         self.root.withdraw()
 
     def _restore_from_tray(self) -> None:
-        self._remove_tray_icon()
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
@@ -2088,7 +2090,10 @@ class ProxyWindow:
             except Exception:
                 pass
             self._tray_icon = None
-        menu = pystray.Menu(pystray.MenuItem("显示", self._on_tray_show, default=True))
+        menu = pystray.Menu(
+            pystray.MenuItem("显示", self._on_tray_show, default=True),
+            pystray.MenuItem("退出", self._on_tray_exit),
+        )
         self._tray_icon = pystray.Icon(_TRAY_ICON_TIP, self._load_tray_icon(), self._build_tray_icon_tip(), menu)
         self._tray_icon.run_detached()
         self._tray_icon_visible = True
@@ -2103,6 +2108,9 @@ class ProxyWindow:
 
     def _on_tray_show(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
         self._post_ui(self._restore_from_tray)
+
+    def _on_tray_exit(self, _icon: pystray.Icon, _item: pystray.MenuItem) -> None:
+        self._post_ui(self._exit_app)
 
     def _refresh_tray_icon_tooltip(self, rows: list[AuthFileRow] | None = None) -> None:
         if not self._tray_icon_visible or self._tray_icon is None:
@@ -2153,6 +2161,9 @@ class ProxyWindow:
         return base_dir / "icon" / "tray_icon.ico"
 
     def _on_close(self) -> None:
+        self._hide_to_tray()
+
+    def _exit_app(self) -> None:
         if not messagebox.askyesno("退出确认", "确认退出程序吗？"):
             return
         self._closing = True
