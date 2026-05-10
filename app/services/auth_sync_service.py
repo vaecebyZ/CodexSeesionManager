@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 import traceback
 from threading import Event, Lock, Thread
@@ -69,6 +70,13 @@ class AuthSyncService:
 
     def stop(self) -> None:
         self._stop_event.set()
+
+    def invalidate_cached_state(self) -> None:
+        with self._state_lock:
+            self._source_signature = None
+            self._source_state = None
+            self._last_notified_source_signature = None
+            self._access_token_to_refresh_token = {}
 
     def update_usage_cache(
         self,
@@ -148,6 +156,20 @@ class AuthSyncService:
             return None
         return data
 
+    def _parse_last_refresh_timestamp(self, text: str) -> float:
+        value = text.strip()
+        if not value:
+            return 0.0
+        if value.endswith("Z"):
+            value = f"{value[:-1]}+00:00"
+        try:
+            return datetime.fromisoformat(value).timestamp()
+        except ValueError:
+            return 0.0
+
+    def _is_target_newer_than_source(self, target_last_refresh: str, source_last_refresh: str) -> bool:
+        return self._parse_last_refresh_timestamp(target_last_refresh) > self._parse_last_refresh_timestamp(source_last_refresh)
+
     def _read_source_state(self, force: bool = False) -> dict[str, str] | None:
         signature = self._get_file_signature(self.source_path)
         if signature is None:
@@ -214,7 +236,12 @@ class AuthSyncService:
                     )
 
         copied = False
-        if target_state != content_signature:
+        target_is_newer = (
+            target_state is not None
+            and target_state[1] == source_state["refresh_token"]
+            and self._is_target_newer_than_source(target_state[3], source_state["last_refresh"])
+        )
+        if target_state != content_signature and not target_is_newer:
             shutil.copy2(self.source_path, target_path)
             copied = True
 

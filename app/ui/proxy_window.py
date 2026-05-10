@@ -22,6 +22,7 @@ from PIL import Image
 
 from app.services.auth_sync_service import AuthFileRow, AuthSyncService
 from app.services.app_config_service import AppConfig, AppConfigService
+from app.services.auth_token_refresh_service import AuthTokenRefreshResult, AuthTokenRefreshService
 from app.services.auth_usage_service import AuthQuotaItem, AuthUsageService
 from app.services.low_price_account_service import LowPriceAccount, LowPriceAccountService
 from tkinter import messagebox, ttk
@@ -66,6 +67,7 @@ class ProxyWindow:
             self.service.config.upstream_proxy = loaded_config.upstream_proxy
             self.service.config.use_upstream_proxy = loaded_config.use_upstream_proxy
         self.auth_sync_service = AuthSyncService()
+        self.auth_token_refresh_service = AuthTokenRefreshService(self.auth_sync_service)
         self.auth_usage_service = AuthUsageService(self.auth_sync_service)
         self.low_price_account_service = LowPriceAccountService()
         self.root.title("Codex 账户管理工具")
@@ -102,6 +104,8 @@ class ProxyWindow:
         self._correct_traffic_refreshing = False
         self._clean_auth_button: ttk.Button | None = None
         self._clean_auth_refreshing = False
+        self._refresh_tokens_button: ttk.Button | None = None
+        self._refresh_tokens_running = False
         self._low_price_window: tk.Toplevel | None = None
         self._low_price_tree: ttk.Treeview | None = None
         self._low_price_refresh_button: ttk.Button | None = None
@@ -255,9 +259,15 @@ class ProxyWindow:
         update_auth_button.pack(side="right", padx=(0, 8))
         low_price_button = ttk.Button(auth_options, text="低价购号", command=self.open_low_price_window)
         low_price_button.pack(side="right", padx=(0, 8))
+        self._refresh_tokens_button = ttk.Button(auth_options, text="一键刷新令牌", command=self.refresh_all_tokens)
+        self._refresh_tokens_button.pack(side="right", padx=(0, 8))
         self._bind_widget_tooltip(
             low_price_button,
             "查看低价账号",
+        )
+        self._bind_widget_tooltip(
+            self._refresh_tokens_button,
+            "遍历授权文件并刷新访问令牌",
         )
         self._bind_widget_tooltip(
             update_auth_button,
@@ -1089,6 +1099,55 @@ class ProxyWindow:
         if not messagebox.askyesno("清理授权", message):
             return
         self._delete_clean_auth_rows(delete_rows)
+
+    def refresh_all_tokens(self) -> None:
+        if self._refresh_tokens_running:
+            return
+        if not self._refresh_config():
+            return
+        self._refresh_tokens_running = True
+        if self._refresh_tokens_button is not None:
+            self._refresh_tokens_button.config(text="刷新中", state="disabled")
+        proxy_url = self._upstream_proxy if self._use_upstream_proxy else ""
+        Thread(target=self._refresh_all_tokens_worker, args=(proxy_url,), daemon=True).start()
+
+    def _refresh_all_tokens_worker(self, proxy_url: str) -> None:
+        result = AuthTokenRefreshResult()
+        error = ""
+        try:
+            result = self.auth_token_refresh_service.refresh_all(proxy_url)
+        except Exception as exc:
+            error = str(exc)
+        try:
+            self._post_ui(lambda value=result, message=error: self._finish_refresh_all_tokens(value, message))
+        except tk.TclError:
+            pass
+
+    def _finish_refresh_all_tokens(self, result: AuthTokenRefreshResult, error: str) -> None:
+        self._refresh_tokens_running = False
+        if self._refresh_tokens_button is not None:
+            self._refresh_tokens_button.config(text="一键刷新令牌", state="normal")
+        if error:
+            messagebox.showerror("刷新令牌失败", error)
+            return
+
+        self.refresh_auth_files(update_status=False)
+        self._recompute_auto_load_target()
+        message = (
+            f"刷新完成。\n\n"
+            f"总数: {result.total}\n"
+            f"成功: {result.refreshed}\n"
+            f"跳过: {result.skipped}\n"
+            f"失败: {result.failed}"
+        )
+        if result.errors:
+            message += "\n\n失败详情:\n" + "\n".join(result.errors[:8])
+            if len(result.errors) > 8:
+                message += f"\n... 还有 {len(result.errors) - 8} 条"
+        if result.failed:
+            messagebox.showwarning("刷新令牌完成", message)
+        else:
+            messagebox.showinfo("刷新令牌完成", message)
 
     def open_low_price_window(self) -> None:
         if self._low_price_window is not None and self._low_price_window.winfo_exists():

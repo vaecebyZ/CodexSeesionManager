@@ -14,6 +14,15 @@ from mitmproxy import http
 _RESELECT_EVENT = "RESELECT"
 _IDLE_TIMEOUT_EVENT = "IDLE_TIMEOUT"
 _MIB_TCP_STATE_DELETE_TCB = 12
+_AUTH_REFRESH_URL_MARKERS = (
+    "/oauth/token",
+)
+_AUTH_REFRESH_BODY_MARKERS = (
+    b"refresh_token",
+    b"refreshtoken",
+    b"grant_type=refresh_token",
+    b'"grant_type":"refresh_token"',
+)
 
 
 class _MibTcpRow(ctypes.Structure):
@@ -227,6 +236,17 @@ class ProxyLoggerAddon:
             return value.removeprefix("Bearer ").strip()
         return ""
 
+    def _should_preserve_original_bearer(self, flow: http.HTTPFlow) -> bool:
+        request = flow.request
+        url = str(getattr(request, "pretty_url", "") or getattr(request, "url", "") or "").lower()
+        path = str(getattr(request, "path", "") or "").lower()
+        if any(marker in url or marker in path for marker in _AUTH_REFRESH_URL_MARKERS):
+            return True
+
+        body = getattr(request, "raw_content", None) or b""
+        body_sample = body[:4096].lower()
+        return any(marker in body_sample for marker in _AUTH_REFRESH_BODY_MARKERS)
+
     def _estimate_http_bytes(self, headers, body) -> int:
         total = 0
         for key, value in headers.items():
@@ -333,9 +353,10 @@ class ProxyLoggerAddon:
         self._cleanup_flows()
         original_token = self._extract_bearer_token(flow)
         selected_token = self._get_selected_access_token()
-        if selected_token:
+        preserve_original = bool(original_token and self._should_preserve_original_bearer(flow))
+        if selected_token and not preserve_original:
             self._rewrite_bearer_headers(flow, selected_token)
-        usage_token = selected_token or original_token
+        usage_token = original_token if preserve_original else selected_token or original_token
         if usage_token:
             self._report_access_token_used(usage_token)
         self._upload_bytes += self._estimate_http_bytes(flow.request.headers, flow.request.raw_content)
