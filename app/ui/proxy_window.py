@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import re
 import socket
@@ -10,7 +11,7 @@ import sys
 import time
 import tkinter as tk
 import webbrowser
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from queue import Empty, Queue
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -24,7 +25,7 @@ from app.services.auth_sync_service import AuthFileRow, AuthSyncService
 from app.services.app_config_service import AppConfig, AppConfigService
 from app.services.auth_token_refresh_service import AuthTokenRefreshResult, AuthTokenRefreshService
 from app.services.auth_usage_service import AuthQuotaItem, AuthUsageService
-from app.services.low_price_account_service import LowPriceAccount, LowPriceAccountService
+from app.services.low_price_account_service import LowPriceAccount, LowPriceAccountService, LowPriceSellerInfo
 from tkinter import messagebox, ttk
 
 from app.services.proxy_service import ProxyConfig, ProxyService
@@ -112,7 +113,14 @@ class ProxyWindow:
         self._low_price_refreshing = False
         self._low_price_items_by_product_id: dict[str, LowPriceAccount] = {}
         self._low_price_product_id_by_item: dict[str, str] = {}
+        self._low_price_item_by_product_id: dict[str, str] = {}
         self._low_price_titles_by_item: dict[str, str] = {}
+        self._low_price_seller_info_by_product_id: dict[str, LowPriceSellerInfo] = {}
+        self._low_price_seller_info_inflight: set[str] = set()
+        self._low_price_seller_info_updated: set[str] = set()
+        self._low_price_seller_info_lock = Lock()
+        self._low_price_seller_info_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="low-price-seller")
+        self._low_price_visible_update_after_id: str | None = None
         self._correct_traffic_after_id: str | None = None
         self._auto_load_target_selected_at = 0.0
         self._quota_priority_by_refresh_token: dict[str, float] = {}
@@ -1162,7 +1170,7 @@ class ProxyWindow:
         dialog.resizable(True, True)
         dialog.protocol("WM_DELETE_WINDOW", self._close_low_price_window)
         self._bind_dialog_close_keys(dialog)
-        self._center_child_window(dialog, 560, 420)
+        self._center_child_window(dialog, 960, 420)
 
         body = ttk.Frame(dialog, padding=12)
         body.pack(fill="both", expand=True)
@@ -1175,22 +1183,48 @@ class ProxyWindow:
         tree_frame = ttk.Frame(body)
         tree_frame.pack(fill="both", expand=True)
 
-        columns = ("productId", "title", "price", "sales")
+        columns = (
+            "title",
+            "price",
+            "sales",
+            "credit",
+            "reviews",
+            "marketplaceYears",
+            "positiveFeedback",
+            "negativeFeedback",
+            "storeSales",
+        )
         self._low_price_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="browse")
-        self._low_price_tree.heading("productId", text="产品id")
         self._low_price_tree.heading("title", text="标题")
         self._low_price_tree.heading("price", text="价格")
         self._low_price_tree.heading("sales", text="销量")
-        self._low_price_tree.column("productId", width=90, anchor="center", stretch=False)
-        self._low_price_tree.column("title", width=230, anchor="w", stretch=False)
-        self._low_price_tree.column("price", width=110, anchor="center", stretch=False)
-        self._low_price_tree.column("sales", width=110, anchor="center", stretch=False)
+        self._low_price_tree.heading("credit", text="信用")
+        self._low_price_tree.heading("reviews", text="评数")
+        self._low_price_tree.heading("marketplaceYears", text="店龄")
+        self._low_price_tree.heading("positiveFeedback", text="好评")
+        self._low_price_tree.heading("negativeFeedback", text="差评")
+        self._low_price_tree.heading("storeSales", text="店销")
+        self._low_price_tree.column("title", width=340, anchor="w", stretch=True)
+        self._low_price_tree.column("price", width=70, anchor="center", stretch=False)
+        self._low_price_tree.column("sales", width=60, anchor="center", stretch=False)
+        self._low_price_tree.column("credit", width=60, anchor="center", stretch=False)
+        self._low_price_tree.column("reviews", width=70, anchor="center", stretch=False)
+        self._low_price_tree.column("marketplaceYears", width=50, anchor="center", stretch=False)
+        self._low_price_tree.column("positiveFeedback", width=70, anchor="center", stretch=False)
+        self._low_price_tree.column("negativeFeedback", width=50, anchor="center", stretch=False)
+        self._low_price_tree.column("storeSales", width=80, anchor="center", stretch=False)
         self._low_price_tree.tag_configure("planKeyword", background="#fff4d6", foreground="#5c4300")
         self._low_price_tree.bind("<Motion>", self._on_low_price_tree_motion)
         self._low_price_tree.bind("<Leave>", lambda _event: self._hide_tooltip())
         self._low_price_tree.bind("<Double-1>", self._on_low_price_tree_double_click)
-        y_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self._low_price_tree.yview)
-        self._low_price_tree.configure(yscrollcommand=y_scroll.set)
+        y_scroll = ttk.Scrollbar(
+            tree_frame,
+            orient="vertical",
+            command=lambda *args: self._low_price_tree_yview(*args),
+        )
+        self._low_price_tree.configure(
+            yscrollcommand=lambda first, last: self._low_price_tree_yscroll(y_scroll, first, last)
+        )
         self._low_price_tree.grid(row=0, column=0, sticky="nsew")
         y_scroll.grid(row=0, column=1, sticky="ns")
         tree_frame.rowconfigure(0, weight=1)
@@ -1232,8 +1266,12 @@ class ProxyWindow:
             return
         self._low_price_items_by_product_id.clear()
         for item in items:
+            seller_info = self._low_price_seller_info_by_product_id.get(item.product_id)
+            if seller_info is not None:
+                item = self._apply_low_price_seller_info_to_item(item, seller_info)
             self._low_price_items_by_product_id[item.product_id] = item
         self._render_low_price_items()
+        self._schedule_low_price_visible_seller_update()
 
     def _set_low_price_buttons_state(self) -> None:
         if self._low_price_refresh_button is None:
@@ -1249,16 +1287,155 @@ class ProxyWindow:
         for item_id in self._low_price_tree.get_children():
             self._low_price_tree.delete(item_id)
         self._low_price_product_id_by_item.clear()
+        self._low_price_item_by_product_id.clear()
         self._low_price_titles_by_item.clear()
         for item in sorted(self._low_price_items_by_product_id.values(), key=self._low_price_sort_key):
             item_id = self._low_price_tree.insert(
                 "",
                 "end",
-                values=(item.product_id, self._format_low_price_title(item.title), item.price, item.sales),
+                values=self._low_price_row_values(item),
                 tags=("planKeyword",) if self._is_low_price_plan_title(item.title) else (),
             )
             self._low_price_product_id_by_item[item_id] = item.product_id
+            self._low_price_item_by_product_id[item.product_id] = item_id
             self._low_price_titles_by_item[item_id] = item.title
+
+    def _low_price_row_values(self, item: LowPriceAccount) -> tuple[str, str, str, str, str, str, str, str, str]:
+        return (
+            self._format_low_price_title(item.title),
+            item.price,
+            item.sales,
+            item.credit,
+            item.reviews,
+            item.marketplace_years,
+            item.positive_feedback,
+            item.negative_feedback,
+            item.store_sales,
+        )
+
+    def _low_price_tree_yview(self, *args: object) -> None:
+        if self._low_price_tree is None:
+            return
+        self._low_price_tree.yview(*args)
+        self._schedule_low_price_visible_seller_update()
+
+    def _low_price_tree_yscroll(self, scrollbar: ttk.Scrollbar, first: str, last: str) -> None:
+        scrollbar.set(first, last)
+        self._schedule_low_price_visible_seller_update()
+
+    def _schedule_low_price_visible_seller_update(self) -> None:
+        if self._low_price_tree is None or self._low_price_refreshing:
+            return
+        if self._low_price_visible_update_after_id is not None:
+            try:
+                self.root.after_cancel(self._low_price_visible_update_after_id)
+            except tk.TclError:
+                pass
+        try:
+            self._low_price_visible_update_after_id = self.root.after(120, self._update_visible_low_price_seller_info)
+        except tk.TclError:
+            self._low_price_visible_update_after_id = None
+
+    def _update_visible_low_price_seller_info(self) -> None:
+        self._low_price_visible_update_after_id = None
+        if self._low_price_tree is None or self._low_price_refreshing:
+            return
+        visible_product_ids = self._get_visible_low_price_product_ids()
+        if not visible_product_ids:
+            self._schedule_low_price_visible_seller_update()
+            return
+        proxy_url = self._get_proxy_for_usage_request()
+        for product_id in visible_product_ids:
+            item = self._low_price_items_by_product_id.get(product_id)
+            if item is None or not item.href:
+                continue
+            cached_info = self._low_price_seller_info_by_product_id.get(product_id)
+            if cached_info is not None:
+                self._apply_low_price_seller_info(product_id, cached_info)
+                continue
+            with self._low_price_seller_info_lock:
+                if (
+                    product_id in self._low_price_seller_info_updated
+                    or product_id in self._low_price_seller_info_inflight
+                ):
+                    continue
+                self._low_price_seller_info_inflight.add(product_id)
+            self._low_price_seller_info_executor.submit(self._fetch_low_price_seller_info_worker, product_id, item.href, proxy_url)
+
+    def _get_visible_low_price_product_ids(self) -> list[str]:
+        if self._low_price_tree is None:
+            return []
+        visible_product_ids: list[str] = []
+        for item_id in self._low_price_tree.get_children():
+            if not self._low_price_tree.bbox(item_id):
+                continue
+            product_id = self._low_price_product_id_by_item.get(item_id, "")
+            if product_id:
+                visible_product_ids.append(product_id)
+        return visible_product_ids
+
+    def _fetch_low_price_seller_info_worker(self, product_id: str, href: str, proxy_url: str) -> None:
+        try:
+            with self._low_price_seller_info_lock:
+                if product_id in self._low_price_seller_info_updated:
+                    self._low_price_seller_info_inflight.discard(product_id)
+                    return
+            seller_info = self.low_price_account_service.fetch_seller_info(href, proxy_url)
+            error = ""
+        except Exception as exc:
+            seller_info = LowPriceSellerInfo()
+            error = str(exc)
+        try:
+            self._post_ui(
+                lambda value=product_id, info=seller_info, err=error: self._finish_low_price_seller_info_update(
+                    value,
+                    info,
+                    err,
+                )
+            )
+        except tk.TclError:
+            pass
+
+    def _finish_low_price_seller_info_update(
+        self,
+        product_id: str,
+        seller_info: LowPriceSellerInfo,
+        error: str,
+    ) -> None:
+        with self._low_price_seller_info_lock:
+            self._low_price_seller_info_inflight.discard(product_id)
+            if not error:
+                self._low_price_seller_info_updated.add(product_id)
+        if error:
+            print(f"[ProxyWindow] 更新低价购号卖家信息失败 product_id={product_id}: {error}", flush=True)
+            return
+        self._low_price_seller_info_by_product_id[product_id] = seller_info
+        self._apply_low_price_seller_info(product_id, seller_info)
+
+    def _apply_low_price_seller_info(self, product_id: str, seller_info: LowPriceSellerInfo) -> None:
+        item = self._low_price_items_by_product_id.get(product_id)
+        if item is None or self._low_price_tree is None:
+            return
+        item = self._apply_low_price_seller_info_to_item(item, seller_info)
+        self._low_price_items_by_product_id[product_id] = item
+        item_id = self._low_price_item_by_product_id.get(product_id, "")
+        if item_id and self._low_price_tree.exists(item_id):
+            self._low_price_tree.item(item_id, values=self._low_price_row_values(item))
+
+    def _apply_low_price_seller_info_to_item(
+        self,
+        item: LowPriceAccount,
+        seller_info: LowPriceSellerInfo,
+    ) -> LowPriceAccount:
+        return replace(
+            item,
+            credit=seller_info.credit,
+            reviews=seller_info.reviews,
+            marketplace_years=seller_info.marketplace_years,
+            positive_feedback=seller_info.positive_feedback,
+            negative_feedback=seller_info.negative_feedback,
+            store_sales=seller_info.store_sales,
+        )
 
     def _low_price_sort_key(self, item: LowPriceAccount) -> tuple[int, int, str]:
         plan_priority = 0 if self._is_low_price_plan_title(item.title) else 1
@@ -1293,7 +1470,7 @@ class ProxyWindow:
         row_id = self._low_price_tree.identify_row(event.y)
         column = self._low_price_tree.identify_column(event.x)
         title = self._low_price_titles_by_item.get(row_id, "")
-        if row_id and column == "#2" and title:
+        if row_id and column == "#1" and title:
             self._show_tooltip(event.x_root, event.y_root, title)
             return
         self._hide_tooltip()
@@ -1319,11 +1496,18 @@ class ProxyWindow:
 
     def _on_low_price_window_destroy(self, event: tk.Event) -> None:
         if event.widget is self._low_price_window:
+            if self._low_price_visible_update_after_id is not None:
+                try:
+                    self.root.after_cancel(self._low_price_visible_update_after_id)
+                except tk.TclError:
+                    pass
+                self._low_price_visible_update_after_id = None
             self._low_price_window = None
             self._low_price_tree = None
             self._low_price_refresh_button = None
             self._low_price_items_by_product_id.clear()
             self._low_price_product_id_by_item.clear()
+            self._low_price_item_by_product_id.clear()
             self._low_price_titles_by_item.clear()
 
     def _start_correct_traffic_countdown(self) -> None:
@@ -2230,6 +2414,7 @@ class ProxyWindow:
         self._persist_config()
         self.auth_usage_service.stop()
         self.auth_sync_service.stop()
+        self._low_price_seller_info_executor.shutdown(wait=False, cancel_futures=True)
         self.service.stop()
         self._auto_load_control_stop.set()
         if self._auto_load_control_socket is not None:

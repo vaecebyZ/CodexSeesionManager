@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from html.parser import HTMLParser
+import re
 from urllib.parse import urlencode, unquote
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
@@ -12,7 +13,34 @@ class LowPriceAccount:
     title: str
     price: str
     sales: str
+    credit: str = ""
+    reviews: str = ""
+    marketplace_years: str = ""
+    positive_feedback: str = ""
+    negative_feedback: str = ""
+    store_sales: str = ""
     href: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class LowPriceSellerInfo:
+    credit: str = ""
+    reviews: str = ""
+    marketplace_years: str = ""
+    positive_feedback: str = ""
+    negative_feedback: str = ""
+    store_sales: str = ""
+
+
+class _TextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        value = " ".join(data.replace("\xa0", " ").split())
+        if value:
+            self.parts.append(value)
 
 
 class _LowPriceAccountParser(HTMLParser):
@@ -154,6 +182,81 @@ class LowPriceAccountService:
         parser = _LowPriceAccountParser()
         parser.feed(html)
         return parser.items
+
+    def fetch_seller_info(self, href: str, proxy_url: str = "") -> LowPriceSellerInfo:
+        url = self._build_product_url(href)
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Cookie": self.COOKIE,
+            },
+        )
+        opener = self._build_opener(proxy_url)
+        response_context = opener.open(request, timeout=20) if opener is not None else urlopen(request, timeout=20)
+        with response_context as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            html = response.read().decode(charset, "replace")
+        return self._parse_seller_info(html)
+
+    def _build_product_url(self, href: str) -> str:
+        path = href if href.startswith("/") else f"/{href}"
+        separator = "&" if "?" in path else "?"
+        return f"https://plati.market{path}{separator}ai=1426781"
+
+    def _parse_seller_info(self, html: str) -> LowPriceSellerInfo:
+        match = re.search(
+            r'<script\s+type="text/template"\s+id="seller_info_popup_template"\s*>(.*?)</script>',
+            html,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return LowPriceSellerInfo()
+        parser = _TextParser()
+        parser.feed(match.group(1))
+        texts = parser.parts
+        rating_values = self._values_after_label(texts, "Rating")
+        return LowPriceSellerInfo(
+            credit=self._compact_number_text(rating_values[1]) if len(rating_values) > 1 else "",
+            reviews=self._normalize_reviews(rating_values[0]) if rating_values else "",
+            marketplace_years=self._first_value_after_label(texts, "On the marketplace"),
+            positive_feedback=self._compact_number_text(self._first_value_after_label(texts, "Positive feedback")),
+            negative_feedback=self._compact_number_text(self._first_value_after_label(texts, "Negative feedback")),
+            store_sales=self._compact_number_text(self._first_value_after_label(texts, "Number of sales")),
+        )
+
+    def _values_after_label(self, texts: list[str], label: str) -> list[str]:
+        labels = {
+            "Rating",
+            "On the marketplace",
+            "Positive feedback",
+            "Negative feedback",
+            "Number of sales",
+            "Store page",
+        }
+        try:
+            start = texts.index(label) + 1
+        except ValueError:
+            return []
+        values: list[str] = []
+        for value in texts[start:]:
+            if value in labels:
+                break
+            values.append(value)
+        return values
+
+    def _first_value_after_label(self, texts: list[str], label: str) -> str:
+        values = self._values_after_label(texts, label)
+        return values[0] if values else ""
+
+    def _normalize_reviews(self, value: str) -> str:
+        return self._compact_number_text(re.sub(r"\s*reviews?\s*$", "", value, flags=re.IGNORECASE).strip())
+
+    def _compact_number_text(self, value: str) -> str:
+        if not re.search(r"\d", value):
+            return value
+        return re.sub(r"\s+", "", value)
 
     def _build_opener(self, proxy_url: str):
         normalized = self._normalize_proxy_url(proxy_url)
