@@ -19,7 +19,7 @@ from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Callable
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 import pystray
 import psutil
@@ -212,7 +212,7 @@ class ProxyWindow:
         actions.pack(side="right", anchor="e")
 
         self._check_update_button = ttk.Button(actions, text="↻", width=3, command=self.check_for_updates)
-        self._check_update_button.pack(side="right")
+        self._check_update_button.pack(side="right", padx=(8, 0))
         ttk.Button(actions, text="一键安装证书", command=self.install_certificate).pack(side="right")
         self.toggle_button = ttk.Button(actions, text="一键启动服务器", command=self.toggle_server)
         self.toggle_button.pack(side="right", padx=(0, 8))
@@ -1052,7 +1052,7 @@ class ProxyWindow:
                     "User-Agent": f"CodexSeesionManager/{APP_VERSION}",
                 },
             )
-            with urlopen(request, timeout=15) as response:
+            with self._open_update_url(request, timeout=15) as response:
                 payload = json.loads(response.read().decode("utf-8", errors="replace"))
             if isinstance(payload, dict):
                 latest_tag = str(payload.get("tag_name") or "").strip()
@@ -1137,6 +1137,21 @@ class ProxyWindow:
             return None
         return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
+    def _open_update_url(self, request: Request, timeout: float):
+        normalized_proxy = self._normalize_update_proxy_url(self._get_proxy_for_usage_request())
+        if not normalized_proxy:
+            return urlopen(request, timeout=timeout)
+        opener = build_opener(ProxyHandler({"http": normalized_proxy, "https": normalized_proxy}))
+        return opener.open(request, timeout=timeout)
+
+    def _normalize_update_proxy_url(self, proxy_url: str) -> str:
+        value = proxy_url.strip()
+        if not value:
+            return ""
+        if "://" not in value:
+            value = f"http://{value}"
+        return value
+
     def _select_release_asset(self, payload: dict[str, object]) -> dict[str, object] | None:
         assets = payload.get("assets")
         if not isinstance(assets, list):
@@ -1178,7 +1193,7 @@ class ProxyWindow:
                 asset_url,
                 headers={"User-Agent": f"CodexSeesionManager/{APP_VERSION}"},
             )
-            with urlopen(request, timeout=60) as response, temp_path.open("wb") as target:
+            with self._open_update_url(request, timeout=60) as response, temp_path.open("wb") as target:
                 total_size = int(response.headers.get("Content-Length") or 0)
                 downloaded = 0
                 last_percent = -1
@@ -1260,6 +1275,7 @@ class ProxyWindow:
     def _write_update_script(self, source_dir: Path) -> Path:
         root_dir = app_root()
         script_path = self._updates_dir() / _UPDATE_SCRIPT_NAME
+        script_path.parent.mkdir(parents=True, exist_ok=True)
         restart_command = self._build_update_restart_command(root_dir)
         script = f"""@echo off
 setlocal
@@ -1267,18 +1283,34 @@ chcp 65001 >nul
 set "PID={os.getpid()}"
 set "SRC={source_dir}"
 set "DST={root_dir}"
+set "LOG={root_dir}\\{_UPDATES_DIR_NAME}\\update-error.log"
+set /a WAIT_SECONDS=0
 
 :wait_app
-tasklist /FI "PID eq %PID%" | find "%PID%" >nul
+tasklist /FI "PID eq %PID%" /NH | findstr /R /C:" %PID% " >nul
 if not errorlevel 1 (
+  set /a WAIT_SECONDS+=1
+  if %WAIT_SECONDS% GEQ 120 goto continue_update
   timeout /t 1 /nobreak >nul
   goto wait_app
 )
 
-robocopy "%SRC%" "%DST%" /E /COPY:DAT /R:5 /W:1 /XD "%DST%\\{_UPDATES_DIR_NAME}" >nul
+:continue_update
+if not exist "%SRC%\\" (
+  echo Update source does not exist: %SRC%>"%LOG%"
+  pause
+  exit /b 1
+)
+if not exist "%DST%\\" (
+  echo Update destination does not exist: %DST%>"%LOG%"
+  pause
+  exit /b 1
+)
+
+robocopy "%SRC%" "%DST%" /E /COPY:DAT /R:10 /W:1 /XD "{_UPDATES_DIR_NAME}" >nul
 set "RC=%ERRORLEVEL%"
 if %RC% GEQ 8 (
-  echo Update failed with robocopy code %RC%>"%DST%\\{_UPDATES_DIR_NAME}\\update-error.log"
+  echo Update failed with robocopy code %RC%>"%LOG%"
   pause
   exit /b %RC%
 )
@@ -1287,7 +1319,7 @@ rmdir /s /q "%DST%\\{_UPDATES_DIR_NAME}\\{_UPDATE_EXTRACT_DIR_NAME}" 2>nul
 del /q "%DST%\\{_UPDATES_DIR_NAME}\\*.zip" 2>nul
 del /q "%DST%\\{_UPDATES_DIR_NAME}\\*.tmp" 2>nul
 {restart_command}
-del "%~f0"
+del "%~f0" >nul 2>nul
 """
         script_path.write_text(script, encoding="utf-8")
         return script_path
