@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import re
@@ -11,21 +12,26 @@ import sys
 import time
 import tkinter as tk
 import webbrowser
+import zipfile
 from dataclasses import dataclass, replace
 from queue import Empty, Queue
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Callable
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import pystray
 import psutil
 from PIL import Image
 
+from app.version import APP_VERSION
 from app.services.auth_sync_service import AuthFileRow, AuthSyncService
 from app.services.app_config_service import AppConfig, AppConfigService
 from app.services.auth_token_refresh_service import AuthTokenRefreshResult, AuthTokenRefreshService
 from app.services.auth_usage_service import AuthQuotaItem, AuthUsageService
 from app.services.low_price_account_service import LowPriceAccount, LowPriceAccountService, LowPriceSellerInfo
+from app.utils.path_utils import app_root
 from tkinter import messagebox, ttk
 
 from app.services.proxy_service import ProxyConfig, ProxyService
@@ -39,6 +45,12 @@ _TRAY_ICON_MAX_ROWS = 4
 _TRAY_ICON_MAX_TIP_LENGTH = 120
 _TRAY_WATCHDOG_INTERVAL_MS = 5000
 _CHINA_TIMEZONE = timezone(timedelta(hours=8))
+_LATEST_RELEASE_API_URL = "https://api.github.com/repos/lianshufeng/CodexSeesionManager/releases/latest"
+_RELEASES_URL = "https://github.com/lianshufeng/CodexSeesionManager/releases"
+_UPDATE_CHUNK_SIZE = 1024 * 256
+_UPDATES_DIR_NAME = ".updates"
+_UPDATE_EXTRACT_DIR_NAME = "extracted"
+_UPDATE_SCRIPT_NAME = "apply_update.bat"
 
 
 @dataclass
@@ -132,6 +144,11 @@ class ProxyWindow:
         self._port_entry: ttk.Entry | None = None
         self._upstream_entry: ttk.Entry | None = None
         self._traffic_status_var = tk.StringVar(value="上行: 0  下行: 0")
+        self._version_var = tk.StringVar(value=f"版本: {APP_VERSION}")
+        self._update_status_var = tk.StringVar(value="")
+        self._check_update_button: ttk.Button | None = None
+        self._checking_update = False
+        self._downloading_update = False
         self._traffic_refresh_pending = False
         self._quota_refresh_pending = False
         self._ui_queue: Queue[Callable[[], None]] = Queue()
@@ -144,6 +161,7 @@ class ProxyWindow:
         self._tray_icon: pystray.Icon | None = None
 
         self._build_ui()
+        self._cleanup_old_update_files()
         self.root.after(50, self._drain_ui_queue)
         self.root.after(_TRAY_WATCHDOG_INTERVAL_MS, self._tray_icon_watchdog)
         self.auth_sync_service.set_change_callback(lambda: self._post_ui(self._schedule_refresh_auth_files))
@@ -193,9 +211,15 @@ class ProxyWindow:
         actions = ttk.Frame(top)
         actions.pack(side="right", anchor="e")
 
+        self._check_update_button = ttk.Button(actions, text="↻", width=3, command=self.check_for_updates)
+        self._check_update_button.pack(side="right")
         ttk.Button(actions, text="一键安装证书", command=self.install_certificate).pack(side="right")
         self.toggle_button = ttk.Button(actions, text="一键启动服务器", command=self.toggle_server)
         self.toggle_button.pack(side="right", padx=(0, 8))
+        self._bind_widget_tooltip(
+            self._check_update_button,
+            "检查更新",
+        )
 
         tables = ttk.Frame(main)
         tables.pack(fill="both", expand=True, pady=(12, 0))
@@ -339,6 +363,8 @@ class ProxyWindow:
 
         traffic_frame = ttk.Frame(main)
         traffic_frame.pack(fill="x", pady=(8, 0))
+        ttk.Label(traffic_frame, textvariable=self._version_var).pack(side="left")
+        ttk.Label(traffic_frame, textvariable=self._update_status_var).pack(side="left", padx=(12, 0))
         ttk.Label(traffic_frame, textvariable=self._traffic_status_var).pack(side="right")
 
     def _center_window(self, width: int, height: int) -> None:
@@ -1003,6 +1029,317 @@ class ProxyWindow:
             messagebox.showinfo("安装结果", message)
         else:
             messagebox.showerror("安装失败", message)
+
+    def check_for_updates(self) -> None:
+        if self._checking_update or self._downloading_update:
+            return
+        self._checking_update = True
+        self._update_status_var.set("检查更新中...")
+        self._set_update_button_busy("...")
+        Thread(target=self._check_for_updates_worker, daemon=True).start()
+
+    def _check_for_updates_worker(self) -> None:
+        latest_tag = ""
+        latest_url = _RELEASES_URL
+        asset_name = ""
+        asset_url = ""
+        error = ""
+        try:
+            request = Request(
+                _LATEST_RELEASE_API_URL,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": f"CodexSeesionManager/{APP_VERSION}",
+                },
+            )
+            with urlopen(request, timeout=15) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+            if isinstance(payload, dict):
+                latest_tag = str(payload.get("tag_name") or "").strip()
+                latest_url = str(payload.get("html_url") or "").strip() or _RELEASES_URL
+                asset = self._select_release_asset(payload)
+                if asset is not None:
+                    asset_name = str(asset.get("name") or "").strip()
+                    asset_url = str(asset.get("browser_download_url") or "").strip()
+            if not latest_tag:
+                error = "未获取到最新版本号。"
+        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            error = str(exc)
+
+        try:
+            self._post_ui(
+                lambda tag=latest_tag,
+                url=latest_url,
+                download_name=asset_name,
+                download_url=asset_url,
+                message=error: self._finish_check_for_updates(
+                    tag,
+                    url,
+                    download_name,
+                    download_url,
+                    message,
+                )
+            )
+        except tk.TclError:
+            pass
+
+    def _finish_check_for_updates(
+        self,
+        latest_tag: str,
+        latest_url: str,
+        asset_name: str,
+        asset_url: str,
+        error: str,
+    ) -> None:
+        self._checking_update = False
+        self._set_update_button_idle()
+
+        if error:
+            self._update_status_var.set("")
+            messagebox.showerror("检查更新失败", error)
+            return
+
+        current_version = self._parse_semver(APP_VERSION)
+        latest_version = self._parse_semver(latest_tag)
+        if current_version is None:
+            self._update_status_var.set("")
+            messagebox.showerror("检查更新失败", f"当前版本号格式不正确: {APP_VERSION}")
+            return
+        if latest_version is None:
+            self._update_status_var.set("")
+            messagebox.showerror("检查更新失败", f"远端版本号格式不正确: {latest_tag}\n\n版本号需要使用 0.0.0 格式。")
+            return
+        if latest_version <= current_version:
+            self._update_status_var.set("")
+            messagebox.showinfo("检查更新", f"当前已是最新版本。\n\n当前版本: {APP_VERSION}")
+            return
+
+        if not asset_url:
+            self._update_status_var.set("")
+            if messagebox.askyesno(
+                "发现新版本",
+                f"当前版本: {APP_VERSION}\n最新版本: {latest_tag}\n\n未找到可下载文件，是否打开发布页面？",
+            ):
+                webbrowser.open(latest_url or _RELEASES_URL)
+            return
+
+        if messagebox.askyesno(
+            "发现新版本",
+            f"当前版本: {APP_VERSION}\n最新版本: {latest_tag}\n\n是否立即下载更新？",
+        ):
+            self._download_update(asset_name, asset_url)
+        else:
+            self._update_status_var.set("")
+
+    def _parse_semver(self, version: str) -> tuple[int, int, int] | None:
+        match = re.fullmatch(r"[vV]?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?", version.strip())
+        if not match:
+            return None
+        return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+    def _select_release_asset(self, payload: dict[str, object]) -> dict[str, object] | None:
+        assets = payload.get("assets")
+        if not isinstance(assets, list):
+            return None
+
+        candidates = [asset for asset in assets if isinstance(asset, dict) and asset.get("browser_download_url")]
+        if not candidates:
+            return None
+
+        for asset in candidates:
+            name = str(asset.get("name") or "").lower()
+            if name.endswith(".zip") and "windows" in name:
+                return asset
+        for asset in candidates:
+            name = str(asset.get("name") or "").lower()
+            if name.endswith(".zip"):
+                return asset
+        return candidates[0]
+
+    def _download_update(self, asset_name: str, asset_url: str) -> None:
+        if self._downloading_update:
+            return
+        self._downloading_update = True
+        self._update_status_var.set("下载更新中...")
+        self._set_update_button_busy("↓")
+        Thread(target=self._download_update_worker, args=(asset_name, asset_url), daemon=True).start()
+
+    def _download_update_worker(self, asset_name: str, asset_url: str) -> None:
+        download_path: Path | None = None
+        error = ""
+        try:
+            safe_name = Path(asset_name or "CodexSeesionManager-update.zip").name
+            updates_dir = self._updates_dir()
+            updates_dir.mkdir(parents=True, exist_ok=True)
+            download_path = updates_dir / safe_name
+            temp_path = download_path.with_suffix(download_path.suffix + ".tmp")
+
+            request = Request(
+                asset_url,
+                headers={"User-Agent": f"CodexSeesionManager/{APP_VERSION}"},
+            )
+            with urlopen(request, timeout=60) as response, temp_path.open("wb") as target:
+                total_size = int(response.headers.get("Content-Length") or 0)
+                downloaded = 0
+                last_percent = -1
+                while True:
+                    chunk = response.read(_UPDATE_CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    target.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        percent = min(100, int(downloaded * 100 / total_size))
+                        if percent != last_percent:
+                            last_percent = percent
+                            self._post_update_progress(percent)
+            temp_path.replace(download_path)
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            error = str(exc)
+
+        try:
+            self._post_ui(lambda path=download_path, message=error: self._finish_download_update(path, message))
+        except tk.TclError:
+            pass
+
+    def _finish_download_update(self, download_path: Path | None, error: str) -> None:
+        self._downloading_update = False
+        self._set_update_button_idle()
+
+        if error or download_path is None:
+            messagebox.showerror("更新下载失败", error or "下载文件不存在。")
+            return
+
+        self._update_status_var.set("更新包下载完成")
+        if messagebox.askyesno("更新下载完成", f"更新包已下载到：\n{download_path}\n\n是否立即安装并重启？"):
+            self._install_update(download_path)
+
+    def _install_update(self, download_path: Path) -> None:
+        error = ""
+        script_path: Path | None = None
+        try:
+            source_dir = self._extract_update_package(download_path)
+            script_path = self._write_update_script(source_dir)
+        except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+            error = str(exc)
+
+        if error or script_path is None:
+            messagebox.showerror("更新安装失败", error or "未能创建更新脚本。")
+            return
+
+        if not messagebox.askyesno("准备安装更新", "程序将退出，等待进程释放后自动覆盖安装并重新启动。\n\n是否继续？"):
+            return
+
+        try:
+            subprocess.Popen(
+                ["cmd.exe", "/c", str(script_path)],
+                cwd=str(app_root()),
+                creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+            )
+        except OSError as exc:
+            messagebox.showerror("更新安装失败", str(exc))
+            return
+        self._shutdown_for_update()
+
+    def _extract_update_package(self, download_path: Path) -> Path:
+        updates_dir = self._updates_dir()
+        extract_root = updates_dir / _UPDATE_EXTRACT_DIR_NAME
+        if extract_root.exists():
+            shutil.rmtree(extract_root)
+        extract_root.mkdir(parents=True, exist_ok=True)
+
+        with zipfile.ZipFile(download_path) as archive:
+            archive.extractall(extract_root)
+
+        candidates = [path for path in extract_root.iterdir() if path.is_dir()]
+        files = [path for path in extract_root.iterdir() if path.is_file()]
+        if len(candidates) == 1 and not files:
+            return candidates[0]
+        return extract_root
+
+    def _write_update_script(self, source_dir: Path) -> Path:
+        root_dir = app_root()
+        script_path = self._updates_dir() / _UPDATE_SCRIPT_NAME
+        restart_command = self._build_update_restart_command(root_dir)
+        script = f"""@echo off
+setlocal
+chcp 65001 >nul
+set "PID={os.getpid()}"
+set "SRC={source_dir}"
+set "DST={root_dir}"
+
+:wait_app
+tasklist /FI "PID eq %PID%" | find "%PID%" >nul
+if not errorlevel 1 (
+  timeout /t 1 /nobreak >nul
+  goto wait_app
+)
+
+robocopy "%SRC%" "%DST%" /E /COPY:DAT /R:5 /W:1 /XD "%DST%\\{_UPDATES_DIR_NAME}" >nul
+set "RC=%ERRORLEVEL%"
+if %RC% GEQ 8 (
+  echo Update failed with robocopy code %RC%>"%DST%\\{_UPDATES_DIR_NAME}\\update-error.log"
+  pause
+  exit /b %RC%
+)
+
+rmdir /s /q "%DST%\\{_UPDATES_DIR_NAME}\\{_UPDATE_EXTRACT_DIR_NAME}" 2>nul
+del /q "%DST%\\{_UPDATES_DIR_NAME}\\*.zip" 2>nul
+del /q "%DST%\\{_UPDATES_DIR_NAME}\\*.tmp" 2>nul
+{restart_command}
+del "%~f0"
+"""
+        script_path.write_text(script, encoding="utf-8")
+        return script_path
+
+    def _build_update_restart_command(self, root_dir: Path) -> str:
+        if getattr(sys, "frozen", False):
+            exe_path = root_dir / "codex_session.exe"
+            return f'start "" /D "{root_dir}" "{exe_path}"'
+        script_path = Path(sys.argv[0]).resolve()
+        return f'start "" /D "{root_dir}" "{sys.executable}" "{script_path}"'
+
+    def _post_update_progress(self, percent: int) -> None:
+        try:
+            self._post_ui(lambda value=percent: self._set_update_progress(value))
+        except tk.TclError:
+            pass
+
+    def _set_update_progress(self, percent: int) -> None:
+        value = max(0, min(percent, 100))
+        self._update_status_var.set(f"下载更新 {value}%")
+        if self._check_update_button is not None:
+            self._check_update_button.config(text=f"{value}%")
+
+    def _updates_dir(self) -> Path:
+        return app_root() / _UPDATES_DIR_NAME
+
+    def _cleanup_old_update_files(self) -> None:
+        updates_dir = self._updates_dir()
+        if not updates_dir.exists():
+            return
+        for path in updates_dir.iterdir():
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                elif path.name != "update-error.log":
+                    path.unlink()
+            except OSError as exc:
+                print(f"[Update] 清理旧更新文件失败: {path} {exc}", flush=True)
+
+    def _open_file_location(self, path: Path) -> None:
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", "/select,", str(path)])
+            return
+        webbrowser.open(path.parent.as_uri())
+
+    def _set_update_button_busy(self, text: str) -> None:
+        if self._check_update_button is not None:
+            self._check_update_button.config(text=text, state="disabled")
+
+    def _set_update_button_idle(self) -> None:
+        if self._check_update_button is not None:
+            self._check_update_button.config(text="↻", state="normal")
 
     def refresh_all(self) -> None:
         install_count = self.refresh_installs(update_status=False)
@@ -2409,6 +2746,12 @@ class ProxyWindow:
     def _exit_app(self) -> None:
         if not messagebox.askyesno("退出确认", "确认退出程序吗？"):
             return
+        self._shutdown_app()
+
+    def _shutdown_for_update(self) -> None:
+        self._shutdown_app()
+
+    def _shutdown_app(self) -> None:
         self._closing = True
         self._remove_tray_icon()
         self._persist_config()
