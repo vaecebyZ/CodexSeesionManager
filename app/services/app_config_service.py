@@ -13,6 +13,10 @@ class AppConfig:
     upstream_proxy: str = "127.0.0.1:1088"
     use_upstream_proxy: bool = True
     auto_load: bool = True
+    cloud_s3_address: str = ""
+    cloud_bucket_name: str = ""
+    cloud_account: str = ""
+    cloud_password: str = ""
 
 
 class AppConfigService:
@@ -38,11 +42,18 @@ class AppConfigService:
         upstream_proxy = str(data.get("upstream_proxy") or "127.0.0.1:1088")
         use_upstream_proxy = bool(data.get("use_upstream_proxy", True))
         auto_load = bool(data.get("auto_load", True))
+        cloud_storage = data.get("cloud_storage")
+        if not isinstance(cloud_storage, dict):
+            cloud_storage = {}
         return AppConfig(
             port=port,
             upstream_proxy=upstream_proxy,
             use_upstream_proxy=use_upstream_proxy,
             auto_load=auto_load,
+            cloud_s3_address=str(cloud_storage.get("s3_address") or ""),
+            cloud_bucket_name=str(cloud_storage.get("bucket_name") or ""),
+            cloud_account=str(cloud_storage.get("account") or ""),
+            cloud_password=str(cloud_storage.get("password") or ""),
         )
 
     def save(self, config: AppConfig) -> None:
@@ -52,5 +63,11 @@ class AppConfigService:
             "upstream_proxy": config.upstream_proxy,
             "use_upstream_proxy": config.use_upstream_proxy,
             "auto_load": config.auto_load,
+            "cloud_storage": {
+                "s3_address": config.cloud_s3_address,
+                "bucket_name": config.cloud_bucket_name,
+                "account": config.cloud_account,
+                "password": config.cloud_password,
+            },
         }
         self.config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

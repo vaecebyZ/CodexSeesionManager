@@ -9,6 +9,7 @@ import socket
 import subprocess
 import shutil
 import sys
+import tempfile
 import time
 import tkinter as tk
 import tkinter.font as tkfont
@@ -31,6 +32,7 @@ from app.services.auth_sync_service import AuthFileRow, AuthSyncService
 from app.services.app_config_service import AppConfig, AppConfigService
 from app.services.auth_token_refresh_service import AuthTokenRefreshResult, AuthTokenRefreshService
 from app.services.auth_usage_service import AuthQuotaItem, AuthUsageService
+from app.services.cloud_sync_service import CloudSyncConfig, CloudSyncFile, CloudSyncService, CloudSyncVersion
 from app.services.low_price_account_service import LowPriceAccount, LowPriceAccountService, LowPriceSellerInfo
 from app.utils.path_utils import app_root
 from tkinter import messagebox, ttk
@@ -87,10 +89,19 @@ class ProxyWindow:
         self.root.title("Codex 账户管理工具")
         self.root.minsize(1040, 660)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Escape>", lambda _event: self._on_close())
 
         self.port_var = tk.StringVar(value=str(self.service.config.port))
         self.upstream_proxy_var = tk.StringVar(value=self.service.config.upstream_proxy)
         self.use_upstream_proxy_var = tk.BooleanVar(value=self.service.config.use_upstream_proxy)
+        self.cloud_s3_address_var = tk.StringVar(
+            value=loaded_config.cloud_s3_address if loaded_config is not None else ""
+        )
+        self.cloud_bucket_name_var = tk.StringVar(
+            value=loaded_config.cloud_bucket_name if loaded_config is not None else ""
+        )
+        self.cloud_account_var = tk.StringVar(value=loaded_config.cloud_account if loaded_config is not None else "")
+        self.cloud_password_var = tk.StringVar(value=loaded_config.cloud_password if loaded_config is not None else "")
         self._rows_by_item: dict[str, CodexInstallRow] = {}
         self._launch_buttons: dict[str, ttk.Button] = {}
         self._install_tree_wrap: ttk.Frame | None = None
@@ -150,6 +161,24 @@ class ProxyWindow:
         self._version_var = tk.StringVar(value=f"版本: {APP_VERSION}")
         self._update_status_var = tk.StringVar(value="")
         self._check_update_button: ttk.Button | None = None
+        self._cloud_storage_window: tk.Toplevel | None = None
+        self._cloud_sync_tree: ttk.Treeview | None = None
+        self._cloud_sync_refresh_button: ttk.Button | None = None
+        self._cloud_sync_upload_button: ttk.Button | None = None
+        self._cloud_sync_pull_button: ttk.Button | None = None
+        self._cloud_sync_delete_button: ttk.Button | None = None
+        self._cloud_sync_versions_by_item: dict[str, CloudSyncVersion] = {}
+        self._cloud_sync_running = False
+        self._cloud_sync_config_vars: tuple[tk.StringVar, tk.StringVar, tk.StringVar, tk.StringVar] | None = None
+        self._cloud_sync_config_trace_enabled = True
+        self._cloud_file_window: tk.Toplevel | None = None
+        self._cloud_file_tree: ttk.Treeview | None = None
+        self._cloud_file_delete_button: ttk.Button | None = None
+        self._cloud_file_refresh_button: ttk.Button | None = None
+        self._cloud_file_version: CloudSyncVersion | None = None
+        self._cloud_file_key_by_item: dict[str, str] = {}
+        self._cloud_file_prefix_by_item: dict[str, str] = {}
+        self._cloud_file_running = False
         self._checking_update = False
         self._downloading_update = False
         self._traffic_refresh_pending = False
@@ -214,11 +243,17 @@ class ProxyWindow:
         actions = ttk.Frame(top)
         actions.pack(side="right", anchor="e")
 
+        cloud_button = ttk.Button(actions, text="☁", width=3, command=self.open_cloud_storage_window)
+        cloud_button.pack(side="right", padx=(8, 0))
         self._check_update_button = ttk.Button(actions, text="↻", width=3, command=self.check_for_updates)
         self._check_update_button.pack(side="right", padx=(8, 0))
         ttk.Button(actions, text="一键安装证书", command=self.install_certificate).pack(side="right")
         self.toggle_button = ttk.Button(actions, text="一键启动服务器", command=self.toggle_server)
         self.toggle_button.pack(side="right", padx=(0, 8))
+        self._bind_widget_tooltip(
+            cloud_button,
+            "云同步",
+        )
         self._bind_widget_tooltip(
             self._check_update_button,
             "检查更新",
@@ -816,8 +851,690 @@ class ProxyWindow:
                 upstream_proxy=upstream_proxy,
                 use_upstream_proxy=self.use_upstream_proxy_var.get(),
                 auto_load=self.auto_load_var.get(),
+                cloud_s3_address=self.cloud_s3_address_var.get().strip(),
+                cloud_bucket_name=self.cloud_bucket_name_var.get().strip(),
+                cloud_account=self.cloud_account_var.get().strip(),
+                cloud_password=self.cloud_password_var.get(),
             )
         )
+
+    def open_cloud_storage_window(self) -> None:
+        if self._cloud_storage_window is not None and self._cloud_storage_window.winfo_exists():
+            self._cloud_storage_window.lift()
+            self._cloud_storage_window.focus_force()
+            return
+
+        dialog = tk.Toplevel(self.root)
+        self._cloud_storage_window = dialog
+        dialog.title("云同步")
+        dialog.transient(self.root)
+        dialog.resizable(True, True)
+        dialog.protocol("WM_DELETE_WINDOW", self._close_cloud_storage_window)
+        self._bind_dialog_close_keys(dialog)
+        dialog.bind("<Destroy>", lambda event: self._on_cloud_storage_window_destroy(event, dialog), add="+")
+        self._center_child_window(dialog, 720, 460)
+
+        s3_address_var = tk.StringVar(value=self.cloud_s3_address_var.get())
+        bucket_name_var = tk.StringVar(value=self.cloud_bucket_name_var.get())
+        account_var = tk.StringVar(value=self.cloud_account_var.get())
+        password_var = tk.StringVar(value=self.cloud_password_var.get())
+
+        def persist_cloud_storage(*_args: object) -> None:
+            if not self._cloud_sync_config_trace_enabled:
+                return
+            self.cloud_s3_address_var.set(s3_address_var.get().strip())
+            self.cloud_bucket_name_var.set(bucket_name_var.get().strip())
+            self.cloud_account_var.set(account_var.get().strip())
+            self.cloud_password_var.set(password_var.get())
+            self._persist_config()
+
+        s3_address_var.trace_add("write", persist_cloud_storage)
+        bucket_name_var.trace_add("write", persist_cloud_storage)
+        account_var.trace_add("write", persist_cloud_storage)
+        password_var.trace_add("write", persist_cloud_storage)
+        self._cloud_sync_config_vars = (s3_address_var, bucket_name_var, account_var, password_var)
+
+        body = ttk.Frame(dialog, padding=14)
+        body.pack(fill="both", expand=True)
+        body.rowconfigure(1, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        config_frame = ttk.LabelFrame(body, text="连接配置", padding=10)
+        config_frame.grid(row=0, column=0, sticky="ew")
+        config_frame.columnconfigure(1, weight=1)
+        config_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(config_frame, text="(s3)地址：").grid(row=0, column=0, sticky="e", pady=(0, 8), padx=(0, 8))
+        s3_entry = ttk.Entry(config_frame, textvariable=s3_address_var, width=36)
+        s3_entry.grid(row=0, column=1, columnspan=3, sticky="ew", pady=(0, 8))
+        ttk.Label(config_frame, text="桶名：").grid(row=1, column=0, sticky="e", pady=(0, 8), padx=(0, 8))
+        ttk.Entry(config_frame, textvariable=bucket_name_var, width=24).grid(row=1, column=1, sticky="ew", pady=(0, 8), padx=(0, 12))
+        ttk.Label(config_frame, text="账号：").grid(row=1, column=2, sticky="e", pady=(0, 8), padx=(0, 8))
+        ttk.Entry(config_frame, textvariable=account_var, width=24).grid(row=1, column=3, sticky="ew", pady=(0, 8))
+        ttk.Label(config_frame, text="密码：").grid(row=2, column=0, sticky="e", padx=(0, 8))
+        ttk.Entry(config_frame, textvariable=password_var, width=24, show="*").grid(row=2, column=1, sticky="ew", padx=(0, 12))
+
+        list_frame = ttk.LabelFrame(body, text="云端版本", padding=10)
+        list_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 0))
+        list_frame.rowconfigure(0, weight=1)
+        list_frame.columnconfigure(0, weight=1)
+
+        columns = ("name", "object_count", "size", "last_modified")
+        self._cloud_sync_tree = ttk.Treeview(list_frame, columns=columns, show="headings", selectmode="browse")
+        self._cloud_sync_tree.heading("name", text="版本")
+        self._cloud_sync_tree.heading("object_count", text="文件数")
+        self._cloud_sync_tree.heading("size", text="大小")
+        self._cloud_sync_tree.heading("last_modified", text="最后修改")
+        self._cloud_sync_tree.column("name", width=260, anchor="w", stretch=True)
+        self._cloud_sync_tree.column("object_count", width=80, anchor="center", stretch=False)
+        self._cloud_sync_tree.column("size", width=90, anchor="center", stretch=False)
+        self._cloud_sync_tree.column("last_modified", width=150, anchor="center", stretch=False)
+        self._cloud_sync_tree.bind("<Double-1>", self._on_cloud_sync_tree_double_click)
+        self._cloud_sync_tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self._cloud_sync_tree.yview)
+        self._cloud_sync_tree.configure(yscrollcommand=y_scroll.set)
+        y_scroll.grid(row=0, column=1, sticky="ns")
+
+        button_row = ttk.Frame(body)
+        button_row.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        button_row.columnconfigure(0, weight=1)
+
+        self._cloud_sync_refresh_button = ttk.Button(
+            button_row,
+            text="刷新",
+            command=lambda: self._run_cloud_sync_action("refresh"),
+        )
+        self._cloud_sync_refresh_button.pack(side="right")
+        self._cloud_sync_upload_button = ttk.Button(
+            button_row,
+            text="同步",
+            command=lambda: self._run_cloud_sync_action("upload"),
+        )
+        self._cloud_sync_upload_button.pack(side="right", padx=(0, 8))
+        self._cloud_sync_pull_button = ttk.Button(
+            button_row,
+            text="拉取",
+            command=lambda: self._run_cloud_sync_action("pull"),
+        )
+        self._cloud_sync_pull_button.pack(side="right", padx=(0, 8))
+        self._cloud_sync_delete_button = ttk.Button(
+            button_row,
+            text="删除",
+            command=lambda: self._run_cloud_sync_action("delete"),
+        )
+        self._cloud_sync_delete_button.pack(side="right", padx=(0, 8))
+        s3_entry.focus_set()
+
+    def _close_cloud_storage_window(self) -> None:
+        if self._cloud_storage_window is None:
+            return
+        try:
+            self._cloud_storage_window.destroy()
+        except tk.TclError:
+            pass
+        self._cloud_storage_window = None
+
+    def _on_cloud_storage_window_destroy(self, event: tk.Event, dialog: tk.Toplevel) -> None:
+        if event.widget is dialog:
+            self._cloud_storage_window = None
+            self._cloud_sync_tree = None
+            self._cloud_sync_refresh_button = None
+            self._cloud_sync_upload_button = None
+            self._cloud_sync_pull_button = None
+            self._cloud_sync_delete_button = None
+            self._cloud_sync_versions_by_item.clear()
+            self._cloud_sync_config_vars = None
+
+    def _run_cloud_sync_action(self, action: str) -> None:
+        if self._cloud_sync_running:
+            return
+        service = self._create_cloud_sync_service()
+        if service is None:
+            return
+
+        selected_version = self._get_selected_cloud_sync_version()
+        if action in {"pull", "delete"} and selected_version is None:
+            messagebox.showwarning("云同步", "请先选择一个云端版本。", parent=self._cloud_storage_window)
+            return
+        if action == "delete" and selected_version is not None:
+            if not messagebox.askyesno("云同步", f"确认删除云端版本 {selected_version.name} 吗？", parent=self._cloud_storage_window):
+                return
+        if action == "pull" and selected_version is not None:
+            message = f"确认拉取云端版本 {selected_version.name} 并替换本地对应数据吗？"
+            if not messagebox.askyesno("云同步", message, parent=self._cloud_storage_window):
+                return
+
+        self._cloud_sync_running = True
+        self._set_cloud_sync_buttons_state()
+        Thread(target=self._cloud_sync_worker, args=(service, action, selected_version), daemon=True).start()
+
+    def _create_cloud_sync_service(self) -> CloudSyncService | None:
+        config = CloudSyncConfig(
+            s3_address=self.cloud_s3_address_var.get().strip(),
+            bucket_name=self.cloud_bucket_name_var.get().strip(),
+            account=self.cloud_account_var.get().strip(),
+            password=self.cloud_password_var.get(),
+        )
+        if not config.s3_address or not config.bucket_name or not config.account or not config.password:
+            messagebox.showwarning("云同步", "请先填写云同步配置。", parent=self._cloud_storage_window)
+            return None
+        return CloudSyncService(config, root_dir=app_root())
+
+    def _get_selected_cloud_sync_version(self) -> CloudSyncVersion | None:
+        if self._cloud_sync_tree is None:
+            return None
+        selection = self._cloud_sync_tree.selection()
+        if not selection:
+            return None
+        return self._cloud_sync_versions_by_item.get(selection[0])
+
+    def _on_cloud_sync_tree_double_click(self, event: tk.Event) -> None:
+        if self._cloud_sync_tree is None:
+            return
+        row_id = self._cloud_sync_tree.identify_row(event.y)
+        if not row_id:
+            return
+        version = self._cloud_sync_versions_by_item.get(row_id)
+        if version is None:
+            return
+        self.open_cloud_file_window(version)
+
+    def open_cloud_file_window(self, version: CloudSyncVersion) -> None:
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"云同步文件 - {version.name}")
+        dialog.transient(self.root)
+        dialog.resizable(True, True)
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        self._bind_dialog_close_keys(dialog)
+        self._center_child_window(dialog, 760, 460)
+
+        body = ttk.Frame(dialog, padding=12)
+        body.pack(fill="both", expand=True)
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        tree_frame = ttk.Frame(body)
+        tree_frame.grid(row=0, column=0, sticky="nsew")
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+
+        columns = ("size", "last_modified", "key")
+        tree = ttk.Treeview(tree_frame, columns=columns, selectmode="browse")
+        tree.heading("#0", text="文件")
+        tree.heading("size", text="大小")
+        tree.heading("last_modified", text="最后修改")
+        tree.heading("key", text="云端路径")
+        tree.column("#0", width=340, anchor="w", stretch=True)
+        tree.column("size", width=90, anchor="center", stretch=False)
+        tree.column("last_modified", width=150, anchor="center", stretch=False)
+        tree.column("key", width=320, anchor="w", stretch=True)
+        tree.grid(row=0, column=0, sticky="nsew")
+        y_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=y_scroll.set)
+        y_scroll.grid(row=0, column=1, sticky="ns")
+
+        button_row = ttk.Frame(body)
+        button_row.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        button_row.columnconfigure(0, weight=1)
+        key_by_item: dict[str, str] = {}
+        prefix_by_item: dict[str, str] = {}
+        running = False
+        delete_button: ttk.Button | None = None
+        refresh_button: ttk.Button | None = None
+
+        def set_buttons_state() -> None:
+            state = "disabled" if running else "normal"
+            for button in (delete_button, refresh_button):
+                if button is not None:
+                    button.config(state=state)
+
+        def render_files(files: list[CloudSyncFile]) -> None:
+            if not dialog.winfo_exists():
+                return
+            for item_id in tree.get_children():
+                tree.delete(item_id)
+            key_by_item.clear()
+            prefix_by_item.clear()
+            folder_items: dict[str, str] = {"": ""}
+            for file_item in files:
+                parts = [part for part in file_item.relative_path.split("/") if part]
+                if not parts:
+                    continue
+                parent_key = ""
+                parent_item = ""
+                for folder in parts[:-1]:
+                    folder_key = f"{parent_key}{folder}/"
+                    folder_item = folder_items.get(folder_key)
+                    if folder_item is None:
+                        folder_item = tree.insert(parent_item, "end", text=folder, values=("", "", ""))
+                        folder_items[folder_key] = folder_item
+                        prefix_by_item[folder_item] = f"{version.prefix}{folder_key}"
+                    parent_key = folder_key
+                    parent_item = folder_item
+                item_id = tree.insert(
+                    parent_item,
+                    "end",
+                    text=parts[-1],
+                    values=(self._format_traffic_bytes(file_item.size), file_item.last_modified, file_item.key),
+                )
+                key_by_item[item_id] = file_item.key
+            for item_id in tree.get_children():
+                tree.item(item_id, open=True)
+
+        def finish_refresh(files: list[CloudSyncFile], error: str) -> None:
+            nonlocal running
+            running = False
+            set_buttons_state()
+            if not dialog.winfo_exists():
+                return
+            if error:
+                messagebox.showerror("云同步失败", error, parent=dialog)
+                return
+            render_files(files)
+
+        def refresh_files() -> None:
+            nonlocal running
+            if running:
+                return
+            service = self._create_cloud_sync_service()
+            if service is None:
+                return
+            running = True
+            set_buttons_state()
+
+            def worker() -> None:
+                files: list[CloudSyncFile] = []
+                error = ""
+                try:
+                    files = service.list_version_files(version.prefix)
+                except Exception as exc:
+                    error = str(exc)
+                self._post_ui(lambda: finish_refresh(files, error))
+
+            Thread(target=worker, daemon=True).start()
+
+        def finish_preview(error: str) -> None:
+            nonlocal running
+            running = False
+            set_buttons_state()
+            if dialog.winfo_exists() and error:
+                messagebox.showerror("云同步失败", error, parent=dialog)
+
+        def preview_file(key: str) -> None:
+            nonlocal running
+            if running:
+                return
+            service = self._create_cloud_sync_service()
+            if service is None:
+                return
+            running = True
+            set_buttons_state()
+
+            def worker() -> None:
+                error = ""
+                try:
+                    suffix = Path(key).suffix or ".txt"
+                    preview_dir = Path(tempfile.gettempdir()) / "codex_cloud_sync_preview"
+                    preview_dir.mkdir(parents=True, exist_ok=True)
+                    preview_path = preview_dir / Path(key).name
+                    if preview_path.exists():
+                        preview_path = preview_dir / f"{Path(key).stem}_{int(time.time())}{suffix}"
+                    service.download_file_to(key, preview_path)
+                    subprocess.Popen(["notepad.exe", str(preview_path)])
+                except Exception as exc:
+                    error = str(exc)
+                self._post_ui(lambda: finish_preview(error))
+
+            Thread(target=worker, daemon=True).start()
+
+        def on_tree_double_click(event: tk.Event) -> None:
+            row_id = tree.identify_row(event.y)
+            if not row_id:
+                return
+            key = key_by_item.get(row_id)
+            if key:
+                preview_file(key)
+
+        def on_tree_motion(event: tk.Event) -> None:
+            row_id = tree.identify_row(event.y)
+            if not row_id:
+                tree.configure(cursor="")
+                self._hide_tooltip()
+                return
+            key = key_by_item.get(row_id) or prefix_by_item.get(row_id)
+            if not key:
+                tree.configure(cursor="")
+                self._hide_tooltip()
+                return
+            tree.configure(cursor="hand2" if row_id in key_by_item else "")
+            self._show_tooltip(event.x_root, event.y_root, key)
+
+        def finish_delete(files: list[CloudSyncFile], versions: list[CloudSyncVersion], error: str) -> None:
+            nonlocal running
+            running = False
+            set_buttons_state()
+            if not dialog.winfo_exists():
+                return
+            if error:
+                messagebox.showerror("云同步失败", error, parent=dialog)
+                return
+            render_files(files)
+            self._render_cloud_sync_versions(versions)
+
+        def delete_selected() -> None:
+            nonlocal running
+            if running:
+                return
+            selection = tree.selection()
+            if not selection:
+                messagebox.showwarning("云同步", "请先选择要删除的云端文件。", parent=dialog)
+                return
+            item_id = selection[0]
+            key = key_by_item.get(item_id)
+            prefix = prefix_by_item.get(item_id)
+            name = tree.item(item_id, "text")
+            if not key and not prefix:
+                return
+            message = f"确认删除云端文件 {name} 吗？" if key else f"确认删除云端目录 {name} 及其所有文件吗？"
+            if not messagebox.askyesno("云同步", message, parent=dialog):
+                return
+            service = self._create_cloud_sync_service()
+            if service is None:
+                return
+            running = True
+            set_buttons_state()
+
+            def worker() -> None:
+                files: list[CloudSyncFile] = []
+                versions: list[CloudSyncVersion] = []
+                error = ""
+                try:
+                    if key:
+                        service.delete_file(key)
+                    elif prefix:
+                        service.delete_prefix(prefix)
+                    files = service.list_version_files(version.prefix)
+                    versions = service.list_versions()
+                except Exception as exc:
+                    error = str(exc)
+                self._post_ui(lambda: finish_delete(files, versions, error))
+
+            Thread(target=worker, daemon=True).start()
+
+        tree.bind("<Double-1>", on_tree_double_click)
+        tree.bind("<Motion>", on_tree_motion)
+        tree.bind("<Leave>", lambda _event: self._hide_tooltip())
+        delete_button = ttk.Button(button_row, text="删除", command=delete_selected)
+        delete_button.pack(side="right")
+        refresh_button = ttk.Button(button_row, text="刷新", command=refresh_files)
+        refresh_button.pack(side="right", padx=(0, 8))
+        refresh_files()
+
+    def _close_cloud_file_window(self) -> None:
+        if self._cloud_file_window is None:
+            return
+        try:
+            self._cloud_file_window.destroy()
+        except tk.TclError:
+            pass
+        self._cloud_file_window = None
+
+    def _on_cloud_file_window_destroy(self, event: tk.Event, dialog: tk.Toplevel) -> None:
+        if event.widget is dialog:
+            self._cloud_file_window = None
+            self._cloud_file_tree = None
+            self._cloud_file_delete_button = None
+            self._cloud_file_refresh_button = None
+            self._cloud_file_version = None
+            self._cloud_file_key_by_item.clear()
+            self._cloud_file_prefix_by_item.clear()
+            self._cloud_file_running = False
+
+    def _cloud_sync_worker(
+        self,
+        service: CloudSyncService,
+        action: str,
+        selected_version: CloudSyncVersion | None,
+    ) -> None:
+        versions: list[CloudSyncVersion] = []
+        message = ""
+        error = ""
+        try:
+            if action == "refresh":
+                versions = service.list_versions()
+            elif action == "upload":
+                service.sync_auth()
+                versions = service.list_versions()
+            elif action == "pull":
+                assert selected_version is not None
+                service.pull_version(selected_version.prefix)
+                versions = service.list_versions()
+            elif action == "delete":
+                assert selected_version is not None
+                service.delete_version(selected_version.prefix)
+                versions = service.list_versions()
+        except Exception as exc:
+            error = str(exc)
+        self._post_ui(lambda: self._finish_cloud_sync_action(versions, message, error, action))
+
+    def _finish_cloud_sync_action(
+        self,
+        versions: list[CloudSyncVersion],
+        message: str,
+        error: str,
+        action: str,
+    ) -> None:
+        self._cloud_sync_running = False
+        self._set_cloud_sync_buttons_state()
+        if error:
+            messagebox.showerror("云同步失败", error, parent=self._cloud_storage_window)
+            return
+        self._render_cloud_sync_versions(versions)
+        if action == "pull":
+            self._reload_config_from_disk()
+            self.auth_sync_service.invalidate_cached_state()
+            self.refresh_auth_files(update_status=False)
+            messagebox.showinfo("云同步", "拉取完成，已替换本地对应数据。", parent=self._cloud_storage_window)
+        elif action == "upload":
+            messagebox.showinfo("云同步", "同步完成。", parent=self._cloud_storage_window)
+
+    def _render_cloud_sync_versions(self, versions: list[CloudSyncVersion]) -> None:
+        if self._cloud_sync_tree is None:
+            return
+        for item_id in self._cloud_sync_tree.get_children():
+            self._cloud_sync_tree.delete(item_id)
+        self._cloud_sync_versions_by_item.clear()
+        for version in versions:
+            item_id = self._cloud_sync_tree.insert(
+                "",
+                "end",
+                values=(
+                    version.name,
+                    version.object_count,
+                    self._format_traffic_bytes(version.size),
+                    version.last_modified,
+                ),
+            )
+            self._cloud_sync_versions_by_item[item_id] = version
+
+    def _set_cloud_sync_buttons_state(self) -> None:
+        buttons = (
+            self._cloud_sync_refresh_button,
+            self._cloud_sync_upload_button,
+            self._cloud_sync_pull_button,
+            self._cloud_sync_delete_button,
+        )
+        state = "disabled" if self._cloud_sync_running else "normal"
+        for button in buttons:
+            if button is not None:
+                button.config(state=state)
+
+    def _refresh_cloud_file_tree(self) -> None:
+        if self._cloud_file_running:
+            return
+        service = self._create_cloud_sync_service()
+        if service is None or self._cloud_file_version is None:
+            return
+        self._cloud_file_running = True
+        self._set_cloud_file_buttons_state()
+        Thread(target=self._cloud_file_refresh_worker, args=(service, self._cloud_file_version), daemon=True).start()
+
+    def _cloud_file_refresh_worker(self, service: CloudSyncService, version: CloudSyncVersion) -> None:
+        files: list[CloudSyncFile] = []
+        error = ""
+        try:
+            files = service.list_version_files(version.prefix)
+        except Exception as exc:
+            error = str(exc)
+        self._post_ui(lambda: self._finish_cloud_file_refresh(files, error))
+
+    def _finish_cloud_file_refresh(self, files: list[CloudSyncFile], error: str) -> None:
+        self._cloud_file_running = False
+        self._set_cloud_file_buttons_state()
+        if error:
+            messagebox.showerror("云同步失败", error, parent=self._cloud_file_window)
+            return
+        self._render_cloud_files(files)
+
+    def _render_cloud_files(self, files: list[CloudSyncFile]) -> None:
+        if self._cloud_file_tree is None or self._cloud_file_version is None:
+            return
+        for item_id in self._cloud_file_tree.get_children():
+            self._cloud_file_tree.delete(item_id)
+        self._cloud_file_key_by_item.clear()
+        self._cloud_file_prefix_by_item.clear()
+
+        folder_items: dict[str, str] = {"": ""}
+        for file_item in files:
+            parts = [part for part in file_item.relative_path.split("/") if part]
+            if not parts:
+                continue
+            parent_key = ""
+            parent_item = ""
+            for folder in parts[:-1]:
+                folder_key = f"{parent_key}{folder}/"
+                folder_item = folder_items.get(folder_key)
+                if folder_item is None:
+                    folder_item = self._cloud_file_tree.insert(parent_item, "end", text=folder, values=("", "", ""))
+                    folder_items[folder_key] = folder_item
+                    self._cloud_file_prefix_by_item[folder_item] = f"{self._cloud_file_version.prefix}{folder_key}"
+                parent_key = folder_key
+                parent_item = folder_item
+
+            item_id = self._cloud_file_tree.insert(
+                parent_item,
+                "end",
+                text=parts[-1],
+                values=(
+                    self._format_traffic_bytes(file_item.size),
+                    file_item.last_modified,
+                    file_item.key,
+                ),
+            )
+            self._cloud_file_key_by_item[item_id] = file_item.key
+        for item_id in self._cloud_file_tree.get_children():
+            self._cloud_file_tree.item(item_id, open=True)
+
+    def _on_cloud_file_tree_double_click(self, event: tk.Event) -> None:
+        if self._cloud_file_tree is None:
+            return
+        row_id = self._cloud_file_tree.identify_row(event.y)
+        if not row_id:
+            return
+        key = self._cloud_file_key_by_item.get(row_id)
+        if not key:
+            return
+        self._preview_cloud_file(key)
+
+    def _preview_cloud_file(self, key: str) -> None:
+        if self._cloud_file_running:
+            return
+        service = self._create_cloud_sync_service()
+        if service is None:
+            return
+        self._cloud_file_running = True
+        self._set_cloud_file_buttons_state()
+        Thread(target=self._cloud_file_preview_worker, args=(service, key), daemon=True).start()
+
+    def _cloud_file_preview_worker(self, service: CloudSyncService, key: str) -> None:
+        error = ""
+        try:
+            suffix = Path(key).suffix or ".txt"
+            preview_dir = Path(tempfile.gettempdir()) / "codex_cloud_sync_preview"
+            preview_dir.mkdir(parents=True, exist_ok=True)
+            preview_path = preview_dir / Path(key).name
+            if preview_path.exists():
+                preview_path = preview_dir / f"{Path(key).stem}_{int(time.time())}{suffix}"
+            service.download_file_to(key, preview_path)
+            subprocess.Popen(["notepad.exe", str(preview_path)])
+        except Exception as exc:
+            error = str(exc)
+        self._post_ui(lambda: self._finish_cloud_file_preview(error))
+
+    def _finish_cloud_file_preview(self, error: str) -> None:
+        self._cloud_file_running = False
+        self._set_cloud_file_buttons_state()
+        if error:
+            messagebox.showerror("云同步失败", error, parent=self._cloud_file_window)
+
+    def _delete_selected_cloud_file(self) -> None:
+        if self._cloud_file_tree is None or self._cloud_file_running:
+            return
+        selection = self._cloud_file_tree.selection()
+        if not selection:
+            messagebox.showwarning("云同步", "请先选择要删除的云端文件。", parent=self._cloud_file_window)
+            return
+        item_id = selection[0]
+        key = self._cloud_file_key_by_item.get(item_id)
+        prefix = self._cloud_file_prefix_by_item.get(item_id)
+        name = self._cloud_file_tree.item(item_id, "text")
+        if not key and not prefix:
+            return
+        message = f"确认删除云端文件 {name} 吗？" if key else f"确认删除云端目录 {name} 及其所有文件吗？"
+        if not messagebox.askyesno("云同步", message, parent=self._cloud_file_window):
+            return
+        service = self._create_cloud_sync_service()
+        if service is None:
+            return
+        self._cloud_file_running = True
+        self._set_cloud_file_buttons_state()
+        Thread(target=self._cloud_file_delete_worker, args=(service, key, prefix), daemon=True).start()
+
+    def _cloud_file_delete_worker(self, service: CloudSyncService, key: str | None, prefix: str | None) -> None:
+        versions: list[CloudSyncVersion] = []
+        files: list[CloudSyncFile] = []
+        error = ""
+        try:
+            if key:
+                service.delete_file(key)
+            elif prefix:
+                service.delete_prefix(prefix)
+            if self._cloud_file_version is not None:
+                files = service.list_version_files(self._cloud_file_version.prefix)
+            versions = service.list_versions()
+        except Exception as exc:
+            error = str(exc)
+        self._post_ui(lambda: self._finish_cloud_file_delete(files, versions, error))
+
+    def _finish_cloud_file_delete(
+        self,
+        files: list[CloudSyncFile],
+        versions: list[CloudSyncVersion],
+        error: str,
+    ) -> None:
+        self._cloud_file_running = False
+        self._set_cloud_file_buttons_state()
+        if error:
+            messagebox.showerror("云同步失败", error, parent=self._cloud_file_window)
+            return
+        self._render_cloud_files(files)
+        self._render_cloud_sync_versions(versions)
+
+    def _set_cloud_file_buttons_state(self) -> None:
+        state = "disabled" if self._cloud_file_running else "normal"
+        for button in (self._cloud_file_delete_button, self._cloud_file_refresh_button):
+            if button is not None:
+                button.config(state=state)
 
     def _get_proxy_for_usage_request(self) -> str:
         with self._proxy_lock:
@@ -829,6 +1546,35 @@ class ProxyWindow:
         with self._proxy_lock:
             self._use_upstream_proxy = self.use_upstream_proxy_var.get()
             self._upstream_proxy = self.upstream_proxy_var.get().strip()
+
+    def _reload_config_from_disk(self) -> None:
+        loaded_config = self.config_service.load()
+        if loaded_config is None:
+            return
+        self.port_var.set(str(loaded_config.port))
+        self.upstream_proxy_var.set(loaded_config.upstream_proxy)
+        self.use_upstream_proxy_var.set(loaded_config.use_upstream_proxy)
+        self.auto_load_var.set(loaded_config.auto_load)
+        self.cloud_s3_address_var.set(loaded_config.cloud_s3_address)
+        self.cloud_bucket_name_var.set(loaded_config.cloud_bucket_name)
+        self.cloud_account_var.set(loaded_config.cloud_account)
+        self.cloud_password_var.set(loaded_config.cloud_password)
+        self._auto_load_enabled = loaded_config.auto_load
+        self._sync_proxy_config_cache()
+        self._refresh_cloud_sync_config_fields()
+
+    def _refresh_cloud_sync_config_fields(self) -> None:
+        if self._cloud_sync_config_vars is None:
+            return
+        s3_address_var, bucket_name_var, account_var, password_var = self._cloud_sync_config_vars
+        self._cloud_sync_config_trace_enabled = False
+        try:
+            s3_address_var.set(self.cloud_s3_address_var.get())
+            bucket_name_var.set(self.cloud_bucket_name_var.get())
+            account_var.set(self.cloud_account_var.get())
+            password_var.set(self.cloud_password_var.get())
+        finally:
+            self._cloud_sync_config_trace_enabled = True
 
     def _on_use_upstream_proxy_toggled(self) -> None:
         if not self._refresh_config():
