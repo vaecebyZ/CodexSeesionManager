@@ -11,6 +11,7 @@ import shutil
 import sys
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 import webbrowser
 import zipfile
 from dataclasses import dataclass, replace
@@ -92,6 +93,8 @@ class ProxyWindow:
         self.use_upstream_proxy_var = tk.BooleanVar(value=self.service.config.use_upstream_proxy)
         self._rows_by_item: dict[str, CodexInstallRow] = {}
         self._launch_buttons: dict[str, ttk.Button] = {}
+        self._install_tree_wrap: ttk.Frame | None = None
+        self._refresh_launch_buttons_after_id: str | None = None
         self._auth_rows_by_item: dict[str, AuthFileRow] = {}
         self._tooltip: tk.Toplevel | None = None
         self._tooltip_label: ttk.Label | None = None
@@ -234,6 +237,7 @@ class ProxyWindow:
 
         tree_wrap = ttk.Frame(table_frame)
         tree_wrap.pack(fill="x", pady=(6, 0))
+        self._install_tree_wrap = tree_wrap
 
         columns = ("name", "path", "size", "version", "action")
         style = ttk.Style()
@@ -259,18 +263,16 @@ class ProxyWindow:
         self.tree.bind("<Button-1>", self._on_tree_click)
         self.tree.bind("<Motion>", self._on_tree_motion)
         self.tree.bind("<Leave>", lambda _event: self._hide_tooltip())
-        self.tree.bind("<Configure>", lambda _event: self._refresh_launch_buttons())
+        self.tree.bind("<Configure>", lambda _event: self._schedule_refresh_launch_buttons())
+        tree_wrap.bind("<Configure>", lambda _event: self._schedule_refresh_launch_buttons())
 
         y_scroll = ttk.Scrollbar(
             tree_wrap,
             orient="vertical",
-            command=lambda *args: (self.tree.yview(*args), self.root.after_idle(self._refresh_launch_buttons)),
+            command=lambda *args: (self.tree.yview(*args), self._schedule_refresh_launch_buttons()),
         )
         self.tree.configure(
-            yscrollcommand=lambda first, last: (
-                y_scroll.set(first, last),
-                self.root.after_idle(self._refresh_launch_buttons),
-            )
+            yscrollcommand=lambda first, last: (y_scroll.set(first, last), self._schedule_refresh_launch_buttons())
         )
         self.tree.grid(row=0, column=0, sticky="nsew")
         y_scroll.grid(row=0, column=1, sticky="ns")
@@ -1586,6 +1588,7 @@ del "%~f0" >nul 2>nul
         self._low_price_tree.bind("<Motion>", self._on_low_price_tree_motion)
         self._low_price_tree.bind("<Leave>", lambda _event: self._hide_tooltip())
         self._low_price_tree.bind("<Double-1>", self._on_low_price_tree_double_click)
+        self._low_price_tree.bind("<Configure>", lambda _event: self._refresh_low_price_title_cells())
         y_scroll = ttk.Scrollbar(
             tree_frame,
             orient="vertical",
@@ -1824,10 +1827,36 @@ del "%~f0" >nul 2>nul
         return int(digits)
 
     def _format_low_price_title(self, title: str) -> str:
-        max_length = 34
-        if len(title) <= max_length:
+        if self._low_price_tree is None:
             return title
-        return f"{title[:max_length - 3]}..."
+        available_width = max(int(self._low_price_tree.column("title", "width")) - 16, 40)
+        font = tkfont.nametofont("TkDefaultFont")
+        if font.measure(title) <= available_width:
+            return title
+
+        ellipsis = "..."
+        ellipsis_width = font.measure(ellipsis)
+        if ellipsis_width >= available_width:
+            return ellipsis
+
+        low = 0
+        high = len(title)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if font.measure(title[:mid]) + ellipsis_width <= available_width:
+                low = mid
+            else:
+                high = mid - 1
+        return f"{title[:low]}{ellipsis}"
+
+    def _refresh_low_price_title_cells(self) -> None:
+        if self._low_price_tree is None:
+            return
+        for item_id, product_id in self._low_price_product_id_by_item.items():
+            item = self._low_price_items_by_product_id.get(product_id)
+            if item is None or not self._low_price_tree.exists(item_id):
+                continue
+            self._low_price_tree.item(item_id, values=self._low_price_row_values(item))
 
     def _is_low_price_plan_title(self, title: str) -> bool:
         return re.search(r"\b(team|plus|pro|business)\b", title, re.IGNORECASE) is not None
@@ -2052,7 +2081,7 @@ del "%~f0" >nul 2>nul
         for row in rows:
             item = self.tree.insert("", "end", values=(row.name, row.display_path, row.size, row.version, ""))
             self._rows_by_item[item] = row
-        self.root.after_idle(self._refresh_launch_buttons)
+        self._schedule_refresh_launch_buttons()
         signature = tuple((row.name, row.display_path, row.size, row.version) for row in rows)
         if update_status and signature != self._last_install_rows_signature:
             print(f"已刷新 {len(rows)} 项")
@@ -2404,7 +2433,7 @@ del "%~f0" >nul 2>nul
             return
         if column == "#5":
             self.tree.configure(cursor="hand2")
-            self._show_tooltip(event.x_root, event.y_root, row.path)
+            self._show_tooltip(event.x_root, event.y_root, "启动")
             return
         if column in {"#1", "#2", "#3", "#4"}:
             self.tree.configure(cursor="")
@@ -2539,42 +2568,16 @@ del "%~f0" >nul 2>nul
         widget.bind("<Motion>", lambda event: self._show_tooltip(event.x_root, event.y_root, text))
         widget.bind("<Leave>", lambda _event: self._hide_tooltip())
 
-    def _destroy_launch_buttons(self) -> None:
-        for button in self._launch_buttons.values():
-            button.destroy()
-        self._launch_buttons.clear()
-
-    def _refresh_launch_buttons(self) -> None:
-        if not hasattr(self, "tree"):
-            return
-        for item in self.tree.get_children():
-            row = self._rows_by_item.get(item)
-            if row is None:
-                continue
-            button = self._launch_buttons.get(item)
-            if button is None:
-                button = ttk.Button(
-                    self.tree,
-                    text="启动",
-                    command=lambda launch_row=row: self._launch_codex(launch_row),
-                )
-                self._launch_buttons[item] = button
-            bbox = self.tree.bbox(item, "action")
-            if not bbox:
-                button.place_forget()
-                continue
-            x, y, width, height = bbox
-            button_width = 56
-            button_height = 24
-            button.place(
-                x=x + max((width - button_width) // 2, 0),
-                y=y + max((height - button_height) // 2, 0),
-                width=button_width,
-                height=button_height,
-            )
-        stale_items = set(self._launch_buttons) - set(self.tree.get_children())
-        for item in stale_items:
-            self._launch_buttons.pop(item).destroy()
+    def _schedule_refresh_launch_buttons(self) -> None:
+        if self._refresh_launch_buttons_after_id is not None:
+            try:
+                self.root.after_cancel(self._refresh_launch_buttons_after_id)
+            except tk.TclError:
+                pass
+        try:
+            self._refresh_launch_buttons_after_id = self.root.after_idle(self._refresh_launch_buttons)
+        except tk.TclError:
+            self._refresh_launch_buttons_after_id = None
 
     def _on_tree_click(self, event: tk.Event) -> None:
         self.tree.selection_remove(self.tree.selection())
@@ -2589,6 +2592,59 @@ del "%~f0" >nul 2>nul
         if not row:
             return
         self._launch_codex(row)
+
+    def _destroy_launch_buttons(self) -> None:
+        if self._refresh_launch_buttons_after_id is not None:
+            try:
+                self.root.after_cancel(self._refresh_launch_buttons_after_id)
+            except tk.TclError:
+                pass
+            self._refresh_launch_buttons_after_id = None
+        for button in self._launch_buttons.values():
+            button.destroy()
+        self._launch_buttons.clear()
+
+    def _refresh_launch_buttons(self) -> None:
+        self._refresh_launch_buttons_after_id = None
+        if self._install_tree_wrap is None or not hasattr(self, "tree"):
+            return
+        try:
+            self.tree.update_idletasks()
+        except tk.TclError:
+            return
+
+        current_items = set(self.tree.get_children())
+        stale_items = set(self._launch_buttons) - current_items
+        for item in stale_items:
+            self._launch_buttons.pop(item).destroy()
+
+        tree_x = self.tree.winfo_x()
+        tree_y = self.tree.winfo_y()
+        for item in self.tree.get_children():
+            row = self._rows_by_item.get(item)
+            if row is None:
+                continue
+            button = self._launch_buttons.get(item)
+            if button is None:
+                button = ttk.Button(
+                    self._install_tree_wrap,
+                    text="启动",
+                    command=lambda launch_row=row: self._launch_codex(launch_row),
+                )
+                self._launch_buttons[item] = button
+            bbox = self.tree.bbox(item, "action")
+            if not bbox:
+                button.place_forget()
+                continue
+            x, y, width, height = bbox
+            button_width = min(56, max(width - 8, 36))
+            button_height = min(24, max(height - 6, 20))
+            button.place(
+                x=tree_x + x + max((width - button_width) // 2, 0),
+                y=tree_y + y + max((height - button_height) // 2, 0),
+                width=button_width,
+                height=button_height,
+            )
 
     def _launch_codex(self, row: CodexInstallRow) -> None:
         exe = Path(row.path)
