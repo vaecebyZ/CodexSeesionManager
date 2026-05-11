@@ -3,12 +3,8 @@ name: Build and Release Windows EXE
 on:
   workflow_dispatch:
     inputs:
-      tag_name:
-        description: "Release tag. Leave empty to use current China time, for example 202605061739."
-        required: false
-        type: string
       release_name:
-        description: "Release title. Leave empty to use the tag."
+        description: "Release title. Leave empty to use app/version.py."
         required: false
         type: string
       prerelease:
@@ -47,9 +43,10 @@ jobs:
           $chinaTimeZone = [TimeZoneInfo]::FindSystemTimeZoneById("China Standard Time")
           $now = [TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::UtcNow, $chinaTimeZone)
           $timestamp = $now.ToString("yyyyMMddHHmm")
-          $tagName = "${{ inputs.tag_name }}"
-          if ([string]::IsNullOrWhiteSpace($tagName)) {
-            $tagName = $timestamp
+          $tagName = python -c "from app.version import APP_VERSION; print(APP_VERSION)"
+          $tagName = $tagName.Trim()
+          if ($tagName -notmatch '^v?\d+\.\d+\.\d+(?:[-+].*)?$') {
+            throw "APP_VERSION must use semantic version format like 1.2.3. Got: $tagName"
           }
           $releaseName = "${{ inputs.release_name }}"
           if ([string]::IsNullOrWhiteSpace($releaseName)) {
